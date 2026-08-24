@@ -323,6 +323,154 @@ describe("DomTranslator", () => {
     ).toBe("Type here");
   });
 
+  it("reconciles owned subtrees moved outside, under protection, or into another scope", async () => {
+    document.body.innerHTML = `
+      <div id="outside"></div>
+      <div id="protected" data-no-translate></div>
+      <div id="conversation" data-testid="conversation-panel"></div>
+      <section class="first">
+        <span id="move-outside" title="Enviar">Enviar</span>
+        <span id="move-protected" title="Enviar">Enviar</span>
+        <span id="move-conversation" title="Enviar">Enviar</span>
+        <span id="move-scope" title="Enviar">Enviar</span>
+      </section>
+      <section class="second"></section>
+    `;
+    const translator = createTranslator([
+      {
+        source: "Enviar",
+        target: "First",
+        scope: ".first",
+        attributes: ["title"],
+      },
+      {
+        source: "Enviar",
+        target: "Second",
+        scope: ".second",
+        attributes: ["title"],
+      },
+    ]);
+    translator.setLocale("en");
+
+    document
+      .querySelector("#outside")
+      ?.append(document.querySelector("#move-outside") as Element);
+    document
+      .querySelector("#protected")
+      ?.append(document.querySelector("#move-protected") as Element);
+    document
+      .querySelector("#conversation")
+      ?.append(document.querySelector("#move-conversation") as Element);
+    document
+      .querySelector(".second")
+      ?.append(document.querySelector("#move-scope") as Element);
+    await flushMutations();
+
+    for (const id of ["move-outside", "move-protected", "move-conversation"]) {
+      expect(document.querySelector(`#${id}`)?.textContent, id).toBe("Enviar");
+      expect(document.querySelector(`#${id}`)?.getAttribute("title"), id).toBe(
+        "Enviar",
+      );
+    }
+    expect(document.querySelector("#move-scope")?.textContent).toBe("Second");
+    expect(document.querySelector("#move-scope")?.getAttribute("title")).toBe(
+      "Second",
+    );
+  });
+
+  it("restores and releases a translated subtree when it is disconnected", async () => {
+    document.body.innerHTML = `
+      <section class="scope"><span id="transient" title="Enviar">Enviar</span></section>
+    `;
+    const translator = createTranslator([
+      {
+        source: "Enviar",
+        target: "Send",
+        scope: ".scope",
+        attributes: ["title"],
+      },
+    ]);
+    translator.setLocale("en");
+    const transient = document.querySelector("#transient") as Element;
+
+    transient.remove();
+    await flushMutations();
+
+    expect(transient.textContent).toBe("Enviar");
+    expect(transient.getAttribute("title")).toBe("Enviar");
+    transient.textContent = "External";
+    transient.setAttribute("title", "External");
+    document.querySelector(".scope")?.append(transient);
+    await flushMutations();
+    translator.setLocale("zh");
+    translator.dispose();
+    expect(transient.textContent).toBe("External");
+    expect(transient.getAttribute("title")).toBe("External");
+  });
+
+  it("immediately releases ownership after unmatched external text and attribute changes", async () => {
+    document.body.innerHTML = `
+      <section class="scope"><span id="external" title="Enviar">Enviar</span></section>
+    `;
+    const translator = createTranslator([
+      {
+        source: "Enviar",
+        target: "Send",
+        scope: ".scope",
+        attributes: ["title"],
+      },
+    ]);
+    translator.setLocale("en");
+    const external = document.querySelector("#external") as Element;
+    const externalText = external.firstChild as Text;
+
+    externalText.data = "Unmatched";
+    external.setAttribute("title", "Unmatched");
+    await flushMutations();
+    externalText.data = "Send";
+    external.setAttribute("title", "Send");
+    translator.setLocale("zh");
+
+    expect(external.textContent).toBe("Send");
+    expect(external.getAttribute("title")).toBe("Send");
+  });
+
+  it("reconciles local subtrees when scope or protection attributes change", async () => {
+    document.body.innerHTML = `
+      <section id="host" data-panel="no"><span id="label">Enviar</span></section>
+    `;
+    const translator = createTranslator([
+      {
+        source: "Enviar",
+        target: "Send",
+        scope: '.active[data-panel="yes"]',
+      },
+    ]);
+    translator.setLocale("en");
+    const host = document.querySelector("#host") as Element;
+
+    host.classList.add("active");
+    host.setAttribute("data-panel", "yes");
+    await flushMutations();
+    expect(document.querySelector("#label")?.textContent).toBe("Send");
+
+    host.classList.remove("active");
+    await flushMutations();
+    expect(document.querySelector("#label")?.textContent).toBe("Enviar");
+
+    host.classList.add("active");
+    await flushMutations();
+    expect(document.querySelector("#label")?.textContent).toBe("Send");
+
+    host.setAttribute("data-no-translate", "");
+    await flushMutations();
+    expect(document.querySelector("#label")?.textContent).toBe("Enviar");
+
+    host.removeAttribute("data-no-translate");
+    await flushMutations();
+    expect(document.querySelector("#label")?.textContent).toBe("Send");
+  });
+
   it("does not feed its own mutations back through another rule", async () => {
     document.body.innerHTML =
       '<section class="outer"><div class="inner"></div></section>';
@@ -522,18 +670,49 @@ describe("DomTranslator", () => {
     expect(bodyQuery).not.toHaveBeenCalled();
   });
 
-  it("observes attributes only when needed with the exact safe filter", () => {
+  it("traverses only topmost roots for nested instances of the same scope", () => {
+    document.body.innerHTML = `
+      <section class="scope">
+        <div class="scope"><span id="nested">Enviar</span></div>
+      </section>
+    `;
+    const createTreeWalker = vi.spyOn(document, "createTreeWalker");
+    const translator = createTranslator([
+      { source: "Enviar", target: "Send", scope: ".scope" },
+    ]);
+
+    translator.setLocale("en");
+
+    expect(document.querySelector("#nested")?.textContent).toBe("Send");
+    expect(createTreeWalker).toHaveBeenCalledTimes(1);
+  });
+
+  it("observes an exact bounded filter for translation, scope, and safety attributes", () => {
     document.body.innerHTML = '<section class="scope"></section>';
     const observe = vi.spyOn(MutationObserver.prototype, "observe");
 
     const textOnly = createTranslator([
-      { source: "Enviar", target: "Send", scope: ".scope" },
+      {
+        source: "Enviar",
+        target: "Send",
+        scope: ".scope[data-panel]",
+      },
     ]);
     textOnly.setLocale("en");
     expect(observe).toHaveBeenLastCalledWith(document.body, {
       childList: true,
       subtree: true,
       characterData: true,
+      attributes: true,
+      attributeFilter: [
+        "class",
+        "id",
+        "contenteditable",
+        "data-no-translate",
+        "data-message-id",
+        "data-testid",
+        "data-panel",
+      ],
     });
     textOnly.dispose();
 
@@ -557,7 +736,17 @@ describe("DomTranslator", () => {
       subtree: true,
       characterData: true,
       attributes: true,
-      attributeFilter: ["title", "placeholder", "aria-label"],
+      attributeFilter: [
+        "title",
+        "placeholder",
+        "aria-label",
+        "class",
+        "id",
+        "contenteditable",
+        "data-no-translate",
+        "data-message-id",
+        "data-testid",
+      ],
     });
   });
 
@@ -625,6 +814,41 @@ describe("DomTranslator", () => {
     ).toHaveLength(1);
   });
 
+  it("translates dynamic nodes from the injected document realm", async () => {
+    const iframe = document.createElement("iframe");
+    document.body.append(iframe);
+    const foreignDocument = iframe.contentDocument;
+    if (foreignDocument === null)
+      throw new Error("iframe document unavailable");
+    foreignDocument.body.innerHTML = `
+      <section class="scope"><span id="initial">Enviar</span></section>
+    `;
+    const translator = new DomTranslator(
+      foreignDocument,
+      [
+        {
+          source: "Enviar",
+          target: "Send",
+          scope: ".scope",
+          attributes: ["title"],
+        },
+      ],
+      createDiagnostics(),
+    );
+    translators.add(translator);
+    translator.setLocale("en");
+    const dynamic = foreignDocument.createElement("span");
+    dynamic.textContent = "Enviar";
+    dynamic.setAttribute("title", "Enviar");
+
+    foreignDocument.querySelector(".scope")?.append(dynamic);
+    await flushMutations();
+
+    expect(foreignDocument.querySelector("#initial")?.textContent).toBe("Send");
+    expect(dynamic.textContent).toBe("Send");
+    expect(dynamic.getAttribute("title")).toBe("Send");
+  });
+
   it("isolates a hostile mutation and continues the same observer batch", async () => {
     document.body.innerHTML = '<section class="scope"></section>';
     const diagnostics = createDiagnostics();
@@ -679,5 +903,32 @@ describe("DomTranslator", () => {
         .snapshot()
         .filter(({ code }) => code === "dom_translation_failed"),
     ).toHaveLength(1);
+  });
+
+  it("isolates a hostile descendant and continues later descendants in the same root", () => {
+    document.body.innerHTML = `
+      <section class="scope">
+        <span id="hostile-descendant" title="Enviar">Enviar</span>
+        <span id="healthy-descendant" title="Enviar">Enviar</span>
+      </section>
+    `;
+    const hostile = document.querySelector("#hostile-descendant") as Element;
+    hostile.closest = (): never => {
+      throw new Error("closest unavailable");
+    };
+    const translator = createTranslator([
+      {
+        source: "Enviar",
+        target: "Send",
+        scope: ".scope",
+        attributes: ["title"],
+      },
+    ]);
+
+    translator.setLocale("en");
+
+    const healthy = document.querySelector("#healthy-descendant");
+    expect(healthy?.textContent).toBe("Send");
+    expect(healthy?.getAttribute("title")).toBe("Send");
   });
 });

@@ -7,6 +7,18 @@ const DOM_TRANSLATION_ATTRIBUTES = new Set<DomTranslationAttribute>([
   "aria-label",
   "alt",
 ]);
+const ELEMENT_NODE = 1;
+const TEXT_NODE = 3;
+const SHOW_ELEMENT_AND_TEXT = 5;
+const SCOPE_AND_PROTECTION_ATTRIBUTES = [
+  "class",
+  "id",
+  "contenteditable",
+  "data-no-translate",
+  "data-message-id",
+  "data-testid",
+];
+const SCOPE_ATTRIBUTE_PATTERN = /\[\s*([^\s~|^$*=\]]+)/g;
 const SHARED_PROTECTED_SURFACES = [
   "[contenteditable]",
   "[data-no-translate]",
@@ -56,17 +68,20 @@ interface ScopeRules {
 interface TextOwnership {
   original: string;
   translated: string;
+  scope: string;
 }
 
 interface AttributeOwnership {
   wasPresent: boolean;
   original: string | null;
   translated: string;
+  scope: string;
 }
 
 export class DomTranslator {
   readonly #scopes: readonly ScopeRules[];
-  readonly #attributeFilter: readonly DomTranslationAttribute[];
+  readonly #attributeFilter: readonly string[];
+  readonly #scopeAndProtectionAttributes: ReadonlySet<string>;
   readonly #textOwnership = new WeakMap<Node, TextOwnership>();
   readonly #ownedTextNodes = new Set<Node>();
   readonly #attributeOwnership = new WeakMap<
@@ -133,8 +148,24 @@ export class DomTranslator {
         return false;
       }
     });
+    const translationAttributes = this.#scopes.flatMap(({ attributes }) => [
+      ...attributes.keys(),
+    ]);
+    const scopeAndProtectionAttributes = new Set(
+      SCOPE_AND_PROTECTION_ATTRIBUTES,
+    );
+    for (const { scope } of this.#scopes) {
+      if (scope === "global") continue;
+      for (const match of scope.matchAll(SCOPE_ATTRIBUTE_PATTERN)) {
+        const attribute = match[1];
+        if (attribute !== undefined) {
+          scopeAndProtectionAttributes.add(attribute.toLowerCase());
+        }
+      }
+    }
+    this.#scopeAndProtectionAttributes = scopeAndProtectionAttributes;
     this.#attributeFilter = Array.from(
-      new Set(this.#scopes.flatMap(({ attributes }) => [...attributes.keys()])),
+      new Set([...translationAttributes, ...scopeAndProtectionAttributes]),
     );
   }
 
@@ -159,6 +190,7 @@ export class DomTranslator {
               ? []
               : [this.document.body]
             : Array.from(this.document.querySelectorAll(scopeRules.scope));
+        roots = this.#topmostRoots(roots);
       } catch {
         this.#reportOnce(
           `initial-query:${scopeRules.scope}`,
@@ -261,12 +293,8 @@ export class DomTranslator {
         childList: true,
         subtree: true,
         characterData: true,
-        ...(this.#attributeFilter.length === 0
-          ? {}
-          : {
-              attributes: true,
-              attributeFilter: [...this.#attributeFilter],
-            }),
+        attributes: true,
+        attributeFilter: [...this.#attributeFilter],
       });
     } catch {
       this.#observer = undefined;
@@ -280,6 +308,7 @@ export class DomTranslator {
 
   #processMutations(records: readonly MutationRecord[]): void {
     if (this.#disposed || this.#locale !== "en") return;
+    const touchedSubtrees = new Set<Node>();
     for (const record of records) {
       try {
         if (record.type === "characterData") {
@@ -288,13 +317,18 @@ export class DomTranslator {
         }
         if (record.type === "attributes") {
           if (
-            record.target instanceof Element &&
+            record.target.nodeType === ELEMENT_NODE &&
             record.attributeName !== null
           ) {
-            this.#translateChangedAttribute(
-              record.target,
-              record.attributeName,
-            );
+            const element = record.target as Element;
+            if (this.#scopeAndProtectionAttributes.has(record.attributeName)) {
+              this.#reconcileSubtree(element);
+              if (this.#isConnectedToDocument(element)) {
+                this.#translateAddedNode(element);
+              }
+            } else {
+              this.#translateChangedAttribute(element, record.attributeName);
+            }
           }
           continue;
         }
@@ -302,12 +336,17 @@ export class DomTranslator {
         this.#reportMutationFailure();
         continue;
       }
+      for (const node of record.removedNodes) touchedSubtrees.add(node);
       for (const node of record.addedNodes) {
-        try {
-          this.#translateAddedNode(node);
-        } catch {
-          this.#reportMutationFailure();
-        }
+        touchedSubtrees.add(node);
+      }
+    }
+    for (const node of touchedSubtrees) {
+      try {
+        this.#reconcileSubtree(node);
+        if (this.#isConnectedToDocument(node)) this.#translateAddedNode(node);
+      } catch {
+        this.#reportMutationFailure();
       }
     }
   }
@@ -321,42 +360,160 @@ export class DomTranslator {
   }
 
   #translateChangedText(node: Node): void {
+    this.#reconcileTextOwnership(node);
     const parent = node.parentElement;
     if (parent === null) return;
     for (const scopeRules of this.#scopes) {
       if (this.#isInScope(parent, scopeRules.scope)) {
-        this.#translateText(node, scopeRules.text);
+        this.#translateText(node, scopeRules);
       }
     }
   }
 
   #translateChangedAttribute(element: Element, attributeName: string): void {
+    this.#reconcileAttributeOwnership(element, attributeName);
     for (const scopeRules of this.#scopes) {
       const rules = scopeRules.attributes.get(
         attributeName as DomTranslationAttribute,
       );
       if (rules !== undefined && this.#isInScope(element, scopeRules.scope)) {
-        this.#translateAttribute(element, attributeName, rules);
+        this.#translateAttribute(
+          element,
+          attributeName,
+          rules,
+          scopeRules.scope,
+        );
       }
     }
   }
 
   #translateAddedNode(node: Node): void {
-    if (node.nodeType === Node.TEXT_NODE) {
+    if (node.nodeType === TEXT_NODE) {
       this.#translateChangedText(node);
       return;
     }
-    if (!(node instanceof Element)) return;
+    if (node.nodeType !== ELEMENT_NODE) return;
+    const element = node as Element;
     for (const scopeRules of this.#scopes) {
-      if (this.#isInScope(node, scopeRules.scope)) {
-        this.#translateRoot(node, scopeRules);
+      if (this.#isInScope(element, scopeRules.scope)) {
+        this.#translateRoot(element, scopeRules);
         continue;
       }
       if (scopeRules.scope === "global") continue;
-      for (const root of node.querySelectorAll(scopeRules.scope)) {
+      const roots = this.#topmostRoots([
+        ...element.querySelectorAll(scopeRules.scope),
+      ]);
+      for (const root of roots) {
         this.#translateRoot(root, scopeRules);
       }
     }
+  }
+
+  #topmostRoots(roots: readonly Element[]): readonly Element[] {
+    if (roots.length < 2) return roots;
+    const candidates = new Set(roots);
+    return roots.filter((root) => {
+      let ancestor = root.parentElement;
+      while (ancestor !== null) {
+        if (candidates.has(ancestor)) return false;
+        ancestor = ancestor.parentElement;
+      }
+      return true;
+    });
+  }
+
+  #reconcileSubtree(root: Node): void {
+    this.#reconcileOwnedNode(root);
+    if (root.nodeType !== ELEMENT_NODE) return;
+
+    const walker = this.document.createTreeWalker(root, SHOW_ELEMENT_AND_TEXT);
+    let node = walker.nextNode();
+    while (node !== null) {
+      try {
+        this.#reconcileOwnedNode(node);
+      } catch {
+        this.#reportMutationFailure();
+      }
+      node = walker.nextNode();
+    }
+  }
+
+  #reconcileOwnedNode(node: Node): void {
+    if (node.nodeType === TEXT_NODE) {
+      this.#reconcileTextOwnership(node);
+    } else if (node.nodeType === ELEMENT_NODE) {
+      this.#reconcileElementOwnership(node as Element);
+    }
+  }
+
+  #reconcileTextOwnership(node: Node): void {
+    const ownership = this.#textOwnership.get(node);
+    if (ownership === undefined) return;
+    const current = node.textContent ?? "";
+    if (current !== ownership.translated) {
+      this.#releaseTextOwnership(node);
+      return;
+    }
+    const parent = node.parentElement;
+    if (
+      parent !== null &&
+      this.#isConnectedToDocument(node) &&
+      this.#isInScope(parent, ownership.scope) &&
+      parent.closest(TEXT_PROTECTED_SURFACE_SELECTOR) === null
+    ) {
+      return;
+    }
+    node.textContent = ownership.original;
+    this.#releaseTextOwnership(node);
+  }
+
+  #reconcileElementOwnership(element: Element): void {
+    const attributes = this.#attributeOwnership.get(element);
+    if (attributes === undefined) return;
+    for (const attribute of [...attributes.keys()]) {
+      this.#reconcileAttributeOwnership(element, attribute);
+    }
+  }
+
+  #reconcileAttributeOwnership(element: Element, attribute: string): void {
+    const attributes = this.#attributeOwnership.get(element);
+    const ownership = attributes?.get(attribute);
+    if (ownership === undefined) return;
+    if (element.getAttribute(attribute) !== ownership.translated) {
+      this.#releaseAttributeOwnership(element, attribute);
+      return;
+    }
+    if (
+      this.#isConnectedToDocument(element) &&
+      this.#isInScope(element, ownership.scope) &&
+      element.closest(ATTRIBUTE_PROTECTED_SURFACE_SELECTOR) === null
+    ) {
+      return;
+    }
+    if (ownership.wasPresent) {
+      element.setAttribute(attribute, ownership.original ?? "");
+    } else {
+      element.removeAttribute(attribute);
+    }
+    this.#releaseAttributeOwnership(element, attribute);
+  }
+
+  #releaseTextOwnership(node: Node): void {
+    this.#textOwnership.delete(node);
+    this.#ownedTextNodes.delete(node);
+  }
+
+  #releaseAttributeOwnership(element: Element, attribute: string): void {
+    const attributes = this.#attributeOwnership.get(element);
+    if (attributes === undefined) return;
+    attributes.delete(attribute);
+    if (attributes.size !== 0) return;
+    this.#attributeOwnership.delete(element);
+    this.#ownedAttributeElements.delete(element);
+  }
+
+  #isConnectedToDocument(node: Node): boolean {
+    return this.document.body?.contains(node) === true;
   }
 
   #translateRoot(root: Element, rules: ScopeRules): void {
@@ -378,27 +535,44 @@ export class DomTranslator {
   }
 
   #translateTree(root: Element, rules: ScopeRules): void {
-    this.#translateAttributes(root, rules.attributes);
+    this.#translateAttributesSafely(root, rules);
     for (const element of root.querySelectorAll("*")) {
-      this.#translateAttributes(element, rules.attributes);
+      this.#translateAttributesSafely(element, rules);
     }
 
-    const walker = this.document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const walker = this.document.createTreeWalker(root, 4);
     let node = walker.nextNode();
     while (node !== null) {
-      this.#translateText(node, rules.text);
+      try {
+        this.#translateText(node, rules);
+      } catch {
+        this.#reportDescendantFailure(rules.scope);
+      }
       node = walker.nextNode();
     }
   }
 
-  #translateText(
-    node: Node,
-    rules: ReadonlyMap<string, DomTranslationRule>,
-  ): void {
+  #translateAttributesSafely(element: Element, rules: ScopeRules): void {
+    try {
+      this.#translateAttributes(element, rules);
+    } catch {
+      this.#reportDescendantFailure(rules.scope);
+    }
+  }
+
+  #reportDescendantFailure(scope: string): void {
+    this.#reportOnce(
+      `descendant:${scope}`,
+      "dom_translation_failed",
+      `A DOM descendant in scope "${scope}" could not be translated.`,
+    );
+  }
+
+  #translateText(node: Node, rules: ScopeRules): void {
     const value = node.textContent ?? "";
     let ownership = this.#textOwnership.get(node);
     if (ownership !== undefined && value === ownership.translated) return;
-    const rule = rules.get(value.trim());
+    const rule = rules.text.get(value.trim());
     const parent = node.parentElement;
     if (
       rule === undefined ||
@@ -411,28 +585,26 @@ export class DomTranslator {
     const end = value.search(/\s*$/);
     const translated = `${value.slice(0, start)}${rule.target}${value.slice(end)}`;
     if (ownership === undefined) {
-      ownership = { original: value, translated };
+      ownership = { original: value, translated, scope: rules.scope };
       this.#textOwnership.set(node, ownership);
       this.#ownedTextNodes.add(node);
     } else {
       ownership.original = value;
       ownership.translated = translated;
+      ownership.scope = rules.scope;
     }
     node.textContent = translated;
   }
 
-  #translateAttributes(
-    element: Element,
-    rules: ScopeRules["attributes"],
-  ): void {
+  #translateAttributes(element: Element, rules: ScopeRules): void {
     if (
-      rules.size === 0 ||
+      rules.attributes.size === 0 ||
       element.closest(ATTRIBUTE_PROTECTED_SURFACE_SELECTOR) !== null
     ) {
       return;
     }
-    for (const [attribute, attributeRules] of rules) {
-      this.#translateAttribute(element, attribute, attributeRules);
+    for (const [attribute, attributeRules] of rules.attributes) {
+      this.#translateAttribute(element, attribute, attributeRules, rules.scope);
     }
   }
 
@@ -440,6 +612,7 @@ export class DomTranslator {
     element: Element,
     attribute: string,
     rules: ReadonlyMap<string, DomTranslationRule>,
+    scope: string,
   ): void {
     if (element.closest(ATTRIBUTE_PROTECTED_SURFACE_SELECTOR) !== null) return;
     const value = element.getAttribute(attribute);
@@ -460,12 +633,14 @@ export class DomTranslator {
         wasPresent: element.hasAttribute(attribute),
         original: value,
         translated: rule.target,
+        scope,
       };
       attributes.set(attribute, ownership);
     } else {
       ownership.wasPresent = element.hasAttribute(attribute);
       ownership.original = value;
       ownership.translated = rule.target;
+      ownership.scope = scope;
     }
     element.setAttribute(attribute, rule.target);
   }
