@@ -1,6 +1,15 @@
 import type { Context } from "@deepseek-ai/cordis";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { apply, inject } from "../src/client/index.js";
+
+function createLogger() {
+  return {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  };
+}
 
 describe("client entrypoint", () => {
   it("declares only the locale runtime dependency", () => {
@@ -8,9 +17,13 @@ describe("client entrypoint", () => {
     expect(typeof apply).toBe("function");
   });
 
-  it("returns a callable disposer", () => {
-    const dispose = apply({} as Context);
+  it("returns an idempotent callable disposer", () => {
+    const dispose = apply({} as Context, {
+      document: null,
+      logger: createLogger(),
+    });
     expect(typeof dispose).toBe("function");
+    expect(() => dispose()).not.toThrow();
     expect(() => dispose()).not.toThrow();
   });
 });
