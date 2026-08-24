@@ -645,6 +645,40 @@ describe("DomTranslator", () => {
     ).toHaveLength(1);
   });
 
+  it("rejects attribute mappings that can invalidate their own nested scope", async () => {
+    document.body.innerHTML = `
+      <section class="wrapper"><span id="feedback" title="Enviar">Enviar</span></section>
+    `;
+    const feedback = document.querySelector("#feedback") as Element;
+    const setAttribute = vi.spyOn(feedback, "setAttribute");
+    const diagnostics = createDiagnostics();
+    const translator = createTranslator(
+      [
+        {
+          source: "Enviar",
+          target: "Send",
+          scope: '.wrapper:has([title="Enviar"])',
+          attributes: ["title"],
+        },
+      ],
+      diagnostics,
+    );
+
+    translator.setLocale("en");
+    await flushMutations();
+    await flushMutations();
+    await flushMutations();
+
+    expect(feedback.textContent).toBe("Send");
+    expect(feedback.getAttribute("title")).toBe("Enviar");
+    expect(
+      setAttribute.mock.calls.filter(([attribute]) => attribute === "title"),
+    ).toHaveLength(0);
+    expect(
+      diagnostics.snapshot().filter(({ code }) => code === "invalid_dom_rule"),
+    ).toHaveLength(1);
+  });
+
   it("queries each declared scope once initially and never rescans document or body on mutations", async () => {
     document.body.innerHTML = '<section class="scope"></section>';
     const documentQuery = vi.spyOn(document, "querySelectorAll");
@@ -668,6 +702,86 @@ describe("DomTranslator", () => {
     expect(added.textContent).toBe("Send");
     expect(documentQuery).not.toHaveBeenCalled();
     expect(bodyQuery).not.toHaveBeenCalled();
+  });
+
+  it("handles structural attributes without rescanning body or unrelated descendants", async () => {
+    document.body.innerHTML = `
+      <section class="plugin"><span id="existing-plugin">Enviar</span></section>
+      <div id="local"><span id="local-label">Enviar</span></div>
+    `;
+    const translator = createTranslator([
+      { source: "Enviar", target: "Send", scope: ".plugin" },
+    ]);
+    translator.setLocale("en");
+    const createTreeWalker = vi.spyOn(document, "createTreeWalker");
+    const bodyQuery = vi.spyOn(document.body, "querySelectorAll");
+
+    document.body.classList.add("unrelated");
+    await flushMutations();
+
+    expect(document.querySelector("#existing-plugin")?.textContent).toBe(
+      "Send",
+    );
+    expect(createTreeWalker).not.toHaveBeenCalled();
+    expect(bodyQuery).not.toHaveBeenCalled();
+
+    const local = document.querySelector("#local") as Element;
+    local.classList.add("plugin");
+    await flushMutations();
+    expect(document.querySelector("#local-label")?.textContent).toBe("Send");
+    expect(createTreeWalker).toHaveBeenCalledTimes(1);
+    expect(createTreeWalker.mock.calls[0]?.[0]).toBe(local);
+    expect(bodyQuery).not.toHaveBeenCalled();
+
+    createTreeWalker.mockClear();
+    local.classList.remove("plugin");
+    await flushMutations();
+    expect(document.querySelector("#local-label")?.textContent).toBe("Enviar");
+    expect(createTreeWalker).not.toHaveBeenCalled();
+
+    local.classList.add("plugin");
+    await flushMutations();
+    expect(document.querySelector("#local-label")?.textContent).toBe("Send");
+    createTreeWalker.mockClear();
+
+    local.setAttribute("data-no-translate", "");
+    await flushMutations();
+    expect(document.querySelector("#local-label")?.textContent).toBe("Enviar");
+    expect(createTreeWalker).not.toHaveBeenCalled();
+
+    local.removeAttribute("data-no-translate");
+    await flushMutations();
+    expect(document.querySelector("#local-label")?.textContent).toBe("Send");
+    expect(createTreeWalker.mock.calls.every(([root]) => root === local)).toBe(
+      true,
+    );
+    expect(bodyQuery).not.toHaveBeenCalled();
+  });
+
+  it("reapplies global rules only when class-based protection clears locally", async () => {
+    document.body.innerHTML = `
+      <div id="class-protected" class="conversation-panel">
+        <span id="global-label">Enviar</span>
+      </div>
+    `;
+    const translator = createTranslator([
+      { source: "Enviar", target: "Send", scope: "global" },
+    ]);
+    translator.setLocale("en");
+    const createTreeWalker = vi.spyOn(document, "createTreeWalker");
+
+    document.body.classList.add("unrelated");
+    await flushMutations();
+    expect(createTreeWalker).not.toHaveBeenCalled();
+
+    const protectedRoot = document.querySelector("#class-protected") as Element;
+    protectedRoot.classList.remove("conversation-panel");
+    await flushMutations();
+
+    expect(document.querySelector("#global-label")?.textContent).toBe("Send");
+    expect(
+      createTreeWalker.mock.calls.every(([root]) => root === protectedRoot),
+    ).toBe(true);
   });
 
   it("traverses only topmost roots for nested instances of the same scope", () => {
@@ -704,6 +818,7 @@ describe("DomTranslator", () => {
       subtree: true,
       characterData: true,
       attributes: true,
+      attributeOldValue: true,
       attributeFilter: [
         "class",
         "id",
@@ -736,6 +851,7 @@ describe("DomTranslator", () => {
       subtree: true,
       characterData: true,
       attributes: true,
+      attributeOldValue: true,
       attributeFilter: [
         "title",
         "placeholder",

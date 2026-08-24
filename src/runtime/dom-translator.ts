@@ -10,13 +10,21 @@ const DOM_TRANSLATION_ATTRIBUTES = new Set<DomTranslationAttribute>([
 const ELEMENT_NODE = 1;
 const TEXT_NODE = 3;
 const SHOW_ELEMENT_AND_TEXT = 5;
-const SCOPE_AND_PROTECTION_ATTRIBUTES = [
+const KNOWN_PROTECTION_ATTRIBUTES = new Set([
   "class",
-  "id",
   "contenteditable",
   "data-no-translate",
   "data-message-id",
   "data-testid",
+]);
+const CLASS_PROTECTION_PATTERN =
+  /conversation|message|markdown|editor|terminal|prompt/i;
+const TEST_ID_PROTECTION_PATTERN =
+  /conversation|message|markdown|editor|terminal|prompt|composer/i;
+const SCOPE_AND_PROTECTION_ATTRIBUTES = [
+  "class",
+  "id",
+  ...KNOWN_PROTECTION_ATTRIBUTES,
 ];
 const SCOPE_ATTRIBUTE_PATTERN = /\[\s*([^\s~|^$*=\]]+)/g;
 const SHARED_PROTECTED_SURFACES = [
@@ -56,6 +64,20 @@ const ATTRIBUTE_PROTECTED_SURFACE_SELECTOR = [
   ...SHARED_PROTECTED_SURFACES,
 ].join(",");
 
+// Dynamic scope activation is intentionally target-local. This lightweight
+// dependency extraction covers class, id, and basic attribute selectors,
+// including attributes nested inside selectors such as :has(...).
+function extractScopeDependencies(scope: string): ReadonlySet<string> {
+  const dependencies = new Set<string>();
+  if (scope.includes(".")) dependencies.add("class");
+  if (scope.includes("#")) dependencies.add("id");
+  for (const match of scope.matchAll(SCOPE_ATTRIBUTE_PATTERN)) {
+    const attribute = match[1];
+    if (attribute !== undefined) dependencies.add(attribute.toLowerCase());
+  }
+  return dependencies;
+}
+
 interface ScopeRules {
   readonly scope: string;
   readonly text: ReadonlyMap<string, DomTranslationRule>;
@@ -63,6 +85,7 @@ interface ScopeRules {
     DomTranslationAttribute,
     ReadonlyMap<string, DomTranslationRule>
   >;
+  readonly dependencies: ReadonlySet<string>;
 }
 
 interface TextOwnership {
@@ -135,32 +158,45 @@ export class DomTranslator {
       text: indexed.text,
       attributes: indexed.attributes,
     }));
-    this.#scopes = indexedScopes.filter(({ scope }) => {
-      if (scope === "global") return true;
-      try {
-        this.document.createDocumentFragment().querySelector(scope);
-        return true;
-      } catch {
-        this.diagnostics.error(
-          "invalid_dom_scope",
-          `Invalid DOM translation scope "${scope}" was ignored.`,
-        );
-        return false;
-      }
-    });
+    this.#scopes = indexedScopes
+      .filter(({ scope }) => {
+        if (scope === "global") return true;
+        try {
+          this.document.createDocumentFragment().querySelector(scope);
+          return true;
+        } catch {
+          this.diagnostics.error(
+            "invalid_dom_scope",
+            `Invalid DOM translation scope "${scope}" was ignored.`,
+          );
+          return false;
+        }
+      })
+      .map(({ scope, text, attributes }) => {
+        const dependencies =
+          scope === "global"
+            ? new Set<string>()
+            : extractScopeDependencies(scope);
+        const safeAttributes = new Map(attributes);
+        for (const attribute of attributes.keys()) {
+          if (!dependencies.has(attribute)) continue;
+          safeAttributes.delete(attribute);
+          this.diagnostics.error(
+            "invalid_dom_rule",
+            `DOM attribute "${attribute}" was ignored because it controls scope "${scope}".`,
+          );
+        }
+        return { scope, text, attributes: safeAttributes, dependencies };
+      });
     const translationAttributes = this.#scopes.flatMap(({ attributes }) => [
       ...attributes.keys(),
     ]);
     const scopeAndProtectionAttributes = new Set(
       SCOPE_AND_PROTECTION_ATTRIBUTES,
     );
-    for (const { scope } of this.#scopes) {
-      if (scope === "global") continue;
-      for (const match of scope.matchAll(SCOPE_ATTRIBUTE_PATTERN)) {
-        const attribute = match[1];
-        if (attribute !== undefined) {
-          scopeAndProtectionAttributes.add(attribute.toLowerCase());
-        }
+    for (const { dependencies } of this.#scopes) {
+      for (const attribute of dependencies) {
+        scopeAndProtectionAttributes.add(attribute);
       }
     }
     this.#scopeAndProtectionAttributes = scopeAndProtectionAttributes;
@@ -295,6 +331,7 @@ export class DomTranslator {
         characterData: true,
         attributes: true,
         attributeFilter: [...this.#attributeFilter],
+        attributeOldValue: true,
       });
     } catch {
       this.#observer = undefined;
@@ -322,9 +359,13 @@ export class DomTranslator {
           ) {
             const element = record.target as Element;
             if (this.#scopeAndProtectionAttributes.has(record.attributeName)) {
-              this.#reconcileSubtree(element);
+              this.#reconcileOwnedWithin(element);
               if (this.#isConnectedToDocument(element)) {
-                this.#translateAddedNode(element);
+                this.#reapplyAfterStructuralAttribute(
+                  element,
+                  record.attributeName,
+                  record.oldValue,
+                );
               }
             } else {
               this.#translateChangedAttribute(element, record.attributeName);
@@ -436,6 +477,73 @@ export class DomTranslator {
       }
       node = walker.nextNode();
     }
+  }
+
+  #reconcileOwnedWithin(root: Element): void {
+    for (const node of this.#ownedTextNodes) {
+      if (!root.contains(node)) continue;
+      try {
+        this.#reconcileTextOwnership(node);
+      } catch {
+        this.#reportMutationFailure();
+      }
+    }
+    for (const element of this.#ownedAttributeElements) {
+      if (element !== root && !root.contains(element)) continue;
+      try {
+        this.#reconcileElementOwnership(element);
+      } catch {
+        this.#reportMutationFailure();
+      }
+    }
+  }
+
+  #reapplyAfterStructuralAttribute(
+    target: Element,
+    attribute: string,
+    oldValue: string | null,
+  ): void {
+    const protectionRemoved = this.#protectionWasRemoved(
+      target,
+      attribute,
+      oldValue,
+    );
+    for (const rules of this.#scopes) {
+      let shouldTranslate = false;
+      if (rules.dependencies.has(attribute)) {
+        shouldTranslate =
+          rules.scope !== "global" && target.matches(rules.scope);
+      }
+      if (
+        !shouldTranslate &&
+        protectionRemoved &&
+        this.#isInScope(target, rules.scope)
+      ) {
+        shouldTranslate = true;
+      }
+      if (shouldTranslate) this.#translateRoot(target, rules);
+    }
+  }
+
+  #protectionWasRemoved(
+    target: Element,
+    attribute: string,
+    oldValue: string | null,
+  ): boolean {
+    if (
+      oldValue === null ||
+      !KNOWN_PROTECTION_ATTRIBUTES.has(attribute) ||
+      target.closest(ATTRIBUTE_PROTECTED_SURFACE_SELECTOR) !== null
+    ) {
+      return false;
+    }
+    if (attribute === "class") {
+      return CLASS_PROTECTION_PATTERN.test(oldValue);
+    }
+    if (attribute === "data-testid") {
+      return TEST_ID_PROTECTION_PATTERN.test(oldValue);
+    }
+    return true;
   }
 
   #reconcileOwnedNode(node: Node): void {
