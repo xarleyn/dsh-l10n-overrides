@@ -53,25 +53,32 @@ export function installLocaleHook(
     return adapter.callOriginal(args);
   };
 
+  installedHooks.set(adapter.runtime, wrapper);
   const installed = adapter.install(wrapper);
   if (!installed.ok) {
     diagnostics.error(
       "locale_hook_install_failed",
       "The DSH locale translator could not be patched; locale overrides were not installed.",
     );
-    if (!installed.runtimeMayBePatched) return () => undefined;
+    if (!installed.runtimeMayBePatched) {
+      installedHooks.delete(adapter.runtime);
+      return () => undefined;
+    }
   }
 
-  installedHooks.set(adapter.runtime, wrapper);
   let disposed = false;
+  let restoreFailureDiagnosed = false;
   return () => {
     if (disposed) return;
     const restored = adapter.restoreOriginalIfCurrent(wrapper);
-    if (!restored.ok) {
+    if (!restored.ok && !restoreFailureDiagnosed) {
+      restoreFailureDiagnosed = true;
       diagnostics.error(
         "locale_hook_restore_failed",
         "The DSH locale translator could not be inspected or restored during disposal.",
       );
+    }
+    if (!restored.ok) {
       return;
     }
     disposed = true;

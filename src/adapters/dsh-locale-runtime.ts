@@ -59,10 +59,35 @@ export function adaptDshLocaleRuntime(
   const originalTranslate = translate;
   const capturedGetSnapshot = getSnapshot;
 
-  function restoreOriginalTranslate(): boolean {
+  function inspectRestoration(
+    wrapper: LocaleTranslate,
+  ): "restored" | "replaced" | "failed" {
+    try {
+      const current = Reflect.get(runtime, "translate");
+      if (current === originalTranslate) return "restored";
+      if (current === wrapper) return "failed";
+      return "replaced";
+    } catch {
+      return "failed";
+    }
+  }
+
+  function restoreOriginalTranslate(
+    wrapper: LocaleTranslate,
+  ): "restored" | "replaced" | "failed" {
     try {
       if (originalTranslateDescriptor === undefined) {
-        if (!Reflect.deleteProperty(runtime, "translate")) return false;
+        const installedDescriptor = Reflect.getOwnPropertyDescriptor(
+          runtime,
+          "translate",
+        );
+        if (installedDescriptor === undefined) {
+          if (!Reflect.set(runtime, "translate", originalTranslate)) {
+            return inspectRestoration(wrapper);
+          }
+        } else if (!Reflect.deleteProperty(runtime, "translate")) {
+          return inspectRestoration(wrapper);
+        }
       } else if ("value" in originalTranslateDescriptor) {
         if (
           !Reflect.defineProperty(
@@ -71,10 +96,12 @@ export function adaptDshLocaleRuntime(
             originalTranslateDescriptor,
           )
         ) {
-          return false;
+          return inspectRestoration(wrapper);
         }
       } else {
-        if (!Reflect.set(runtime, "translate", originalTranslate)) return false;
+        if (!Reflect.set(runtime, "translate", originalTranslate)) {
+          return inspectRestoration(wrapper);
+        }
         if (
           !Reflect.defineProperty(
             runtime,
@@ -82,12 +109,12 @@ export function adaptDshLocaleRuntime(
             originalTranslateDescriptor,
           )
         ) {
-          return false;
+          return inspectRestoration(wrapper);
         }
       }
-      return Reflect.get(runtime, "translate") === originalTranslate;
+      return inspectRestoration(wrapper);
     } catch {
-      return false;
+      return inspectRestoration(wrapper);
     }
   }
 
@@ -123,12 +150,10 @@ export function adaptDshLocaleRuntime(
       const failedInstall = (): LocaleInstallResult => {
         const beforeRollback = inspectCurrent();
         if (beforeRollback === "wrapper") {
-          restoreOriginalTranslate();
-          const afterRollback = inspectCurrent();
+          const restoration = restoreOriginalTranslate(wrapper);
           return {
             ok: false,
-            runtimeMayBePatched:
-              afterRollback === "wrapper" || afterRollback === "unknown",
+            runtimeMayBePatched: restoration === "failed",
           };
         }
         return {
@@ -153,8 +178,10 @@ export function adaptDshLocaleRuntime(
         if (Reflect.get(runtime, "translate") !== wrapper) {
           return { ok: true, value: "replaced" };
         }
-        if (!restoreOriginalTranslate()) return failure();
-        return { ok: true, value: "restored" };
+        const restoration = restoreOriginalTranslate(wrapper);
+        return restoration === "failed"
+          ? failure()
+          : { ok: true, value: restoration };
       } catch {
         return failure();
       }
