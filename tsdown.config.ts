@@ -26,7 +26,7 @@ const configs = [
     platform: "browser",
     target: "es2024",
     dts: false,
-    sourcemap: true,
+    sourcemap: false,
     clean: false,
     deps: {
       neverBundle: CLIENT_EXTERNALS,
