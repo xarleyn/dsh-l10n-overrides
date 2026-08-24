@@ -47,30 +47,34 @@ class FakeLocaleRuntime {
 
 interface ContextOptions {
   readonly onThrows?: boolean;
-  readonly unsubscribeThrows?: boolean;
+  readonly unsubscribeThrowsBeforeRemoveOnce?: boolean;
+  readonly onUnsubscribe?: () => void;
 }
 
 function createContext(
   locale: FakeLocaleRuntime | unknown,
   options: ContextOptions = {},
 ) {
-  let listener: LocaleChangeListener | undefined;
+  const listeners = new Set<LocaleChangeListener>();
   let registrations = 0;
-  let unsubscriptions = 0;
+  let unsubscribeAttempts = 0;
   const ctx = {
     locale,
     on(event: string, next: LocaleChangeListener): () => boolean {
       expect(event).toBe("locale/change");
       registrations += 1;
       if (options.onThrows === true) throw new Error("listener unavailable");
-      listener = next;
+      listeners.add(next);
+      let shouldThrowBeforeRemove =
+        options.unsubscribeThrowsBeforeRemoveOnce === true;
       return () => {
-        unsubscriptions += 1;
-        listener = undefined;
-        if (options.unsubscribeThrows === true) {
+        unsubscribeAttempts += 1;
+        options.onUnsubscribe?.();
+        if (shouldThrowBeforeRemove) {
+          shouldThrowBeforeRemove = false;
           throw new Error("unsubscribe unavailable");
         }
-        return true;
+        return listeners.delete(next);
       };
     },
   };
@@ -81,14 +85,17 @@ function createContext(
       if (locale instanceof FakeLocaleRuntime) {
         locale.active = active;
         locale.revision += 1;
-        listener?.(locale.getSnapshot());
+        for (const listener of listeners) listener(locale.getSnapshot());
       }
     },
     get registrations(): number {
       return registrations;
     },
-    get unsubscriptions(): number {
-      return unsubscriptions;
+    get listenerCount(): number {
+      return listeners.size;
+    },
+    get unsubscribeAttempts(): number {
+      return unsubscribeAttempts;
     },
   };
 }
@@ -110,6 +117,7 @@ async function flushMutations(): Promise<void> {
 afterEach(() => {
   document.body.innerHTML = "";
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("client composition", () => {
@@ -132,6 +140,133 @@ describe("client composition", () => {
 
     dispose();
     expect(locale.translate).toBe(original);
+  });
+
+  it.each(["first", "second"] as const)(
+    "shares one installation when the %s lease is released first",
+    async (releasedFirst) => {
+      const NativeMutationObserver = window.MutationObserver;
+      let observerConstructions = 0;
+      class CountingMutationObserver extends NativeMutationObserver {
+        constructor(callback: MutationCallback) {
+          observerConstructions += 1;
+          super(callback);
+        }
+      }
+      vi.stubGlobal("MutationObserver", CountingMutationObserver);
+      document.body.innerHTML =
+        '<section data-plugin="example-plugin"><button>设置</button></section>';
+      const locale = new FakeLocaleRuntime("en");
+      const original = locale.translate;
+      const boundary = createContext(locale);
+      const firstLogger = createLogger();
+      const secondLogger = createLogger();
+
+      const first = apply(boundary.ctx, { document, logger: firstLogger });
+      const installed = locale.translate;
+      const second = apply(boundary.ctx, { document, logger: secondLogger });
+
+      expect(locale.translate).toBe(installed);
+      expect(boundary.registrations).toBe(1);
+      expect(boundary.listenerCount).toBe(1);
+      expect(observerConstructions).toBe(1);
+      expect(firstLogger.info).toHaveBeenCalledTimes(1);
+      expect(secondLogger.info).not.toHaveBeenCalled();
+
+      const early = releasedFirst === "first" ? first : second;
+      const last = releasedFirst === "first" ? second : first;
+      early();
+
+      expect(locale.translate("example.settings", "title")).toBe("Settings");
+      expect(boundary.listenerCount).toBe(1);
+      const added = document.createElement("span");
+      added.textContent = "设置";
+      document.querySelector("section")?.append(added);
+      await flushMutations();
+      expect(added.textContent).toBe("Settings");
+
+      last();
+      expect(locale.translate).toBe(original);
+      expect(boundary.listenerCount).toBe(0);
+      expect(document.querySelector("button")?.textContent).toBe("设置");
+      expect(added.textContent).toBe("设置");
+
+      const fresh = apply(boundary.ctx, {
+        document,
+        logger: createLogger(),
+      });
+      expect(locale.translate).not.toBe(original);
+      expect(boundary.registrations).toBe(2);
+      expect(boundary.listenerCount).toBe(1);
+      expect(observerConstructions).toBe(2);
+      fresh();
+    },
+  );
+
+  it("retries a listener disposer that throws before removing its listener", () => {
+    document.body.innerHTML =
+      '<section data-plugin="example-plugin"><button>设置</button></section>';
+    const locale = new FakeLocaleRuntime("en");
+    const original = locale.translate;
+    const boundary = createContext(locale, {
+      unsubscribeThrowsBeforeRemoveOnce: true,
+    });
+    const logger = createLogger();
+    const dispose = apply(boundary.ctx, { document, logger });
+
+    dispose();
+    expect(boundary.unsubscribeAttempts).toBe(1);
+    expect(boundary.listenerCount).toBe(1);
+    expect(locale.translate).toBe(original);
+    expect(document.querySelector("button")?.textContent).toBe("设置");
+
+    dispose();
+    expect(boundary.unsubscribeAttempts).toBe(2);
+    expect(boundary.listenerCount).toBe(0);
+    expect(locale.translate).toBe(original);
+    expect(document.querySelector("button")?.textContent).toBe("设置");
+    dispose();
+    expect(boundary.unsubscribeAttempts).toBe(2);
+    expect(logger.error).toHaveBeenCalledTimes(1);
+
+    const fresh = apply(boundary.ctx, { document, logger: createLogger() });
+    expect(boundary.registrations).toBe(2);
+    expect(boundary.listenerCount).toBe(1);
+    expect(locale.translate("example.settings", "title")).toBe("Settings");
+    fresh();
+    fresh();
+    expect(boundary.listenerCount).toBe(0);
+  });
+
+  it("contains a reentrant lease disposal during listener cleanup", () => {
+    const locale = new FakeLocaleRuntime("en");
+    let reenter = (): void => undefined;
+    const boundary = createContext(locale, {
+      onUnsubscribe: () => reenter(),
+    });
+    const first = apply(boundary.ctx, {
+      document,
+      logger: createLogger(),
+    });
+    const second = apply(boundary.ctx, {
+      document,
+      logger: createLogger(),
+    });
+
+    first();
+    expect(boundary.unsubscribeAttempts).toBe(0);
+    expect(boundary.listenerCount).toBe(1);
+    reenter = second;
+    second();
+
+    expect(boundary.registrations).toBe(1);
+    expect(boundary.unsubscribeAttempts).toBe(1);
+    expect(boundary.listenerCount).toBe(0);
+    expect(locale.translate("example.settings", "title")).toBe(
+      "original:en:example.settings:title",
+    );
+    second();
+    expect(boundary.unsubscribeAttempts).toBe(1);
   });
 
   it("follows the public locale/change snapshot and restores Chinese DOM", () => {
@@ -182,7 +317,8 @@ describe("client composition", () => {
 
     dispose();
     expect(button.textContent).toBe("设置");
-    expect(boundary.unsubscriptions).toBe(1);
+    expect(boundary.unsubscribeAttempts).toBe(1);
+    expect(boundary.listenerCount).toBe(0);
     expect(locale.translate).toBe(original);
 
     boundary.emit("en");
@@ -196,7 +332,7 @@ describe("client composition", () => {
     );
 
     expect(() => dispose()).not.toThrow();
-    expect(boundary.unsubscriptions).toBe(1);
+    expect(boundary.unsubscribeAttempts).toBe(1);
   });
 
   it("retries a transient locale-hook restoration failure", () => {
@@ -220,12 +356,12 @@ describe("client composition", () => {
     failTranslateReads = true;
     dispose();
     expect(target.translate).toBe(installed);
-    expect(boundary.unsubscriptions).toBe(1);
+    expect(boundary.unsubscribeAttempts).toBe(1);
 
     failTranslateReads = false;
     dispose();
     expect(target.translate).toBe(original);
-    expect(boundary.unsubscriptions).toBe(1);
+    expect(boundary.unsubscribeAttempts).toBe(1);
   });
 
   it("fails open for an incompatible locale runtime", () => {
@@ -291,7 +427,7 @@ describe("client composition", () => {
 
     const unsubscribeLocale = new FakeLocaleRuntime("en");
     const unsubscribeBoundary = createContext(unsubscribeLocale, {
-      unsubscribeThrows: true,
+      unsubscribeThrowsBeforeRemoveOnce: true,
     });
     const unsubscribeLogger = createLogger();
     const original = unsubscribeLocale.translate;
@@ -305,6 +441,8 @@ describe("client composition", () => {
     expect(unsubscribeLogger.error).toHaveBeenCalledWith(
       expect.stringContaining("locale change listener could not be removed"),
     );
+    disposeUnsubscribe();
+    expect(unsubscribeBoundary.listenerCount).toBe(0);
   });
 
   it("logs one startup summary and gates override-hit diagnostics on debug", () => {

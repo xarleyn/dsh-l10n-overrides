@@ -12,21 +12,21 @@ export function installLocaleHook(
   runtime: unknown,
   registry: TranslationPackRegistry,
   diagnostics: Diagnostics,
-): () => void {
+): () => boolean {
   const adapter = adaptDshLocaleRuntime(runtime);
   if (adapter === undefined) {
     diagnostics.error(
       "incompatible_locale_runtime",
       "The DSH locale runtime is incompatible; locale overrides were not installed.",
     );
-    return () => undefined;
+    return () => true;
   }
   if (installedHooks.has(adapter.runtime)) {
     diagnostics.warning(
       "duplicate_locale_hook",
       "A locale override hook is already installed on this DSH runtime.",
     );
-    return () => undefined;
+    return () => true;
   }
 
   let snapshotFailureDiagnosed = false;
@@ -62,14 +62,14 @@ export function installLocaleHook(
     );
     if (!installed.runtimeMayBePatched) {
       installedHooks.delete(adapter.runtime);
-      return () => undefined;
+      return () => true;
     }
   }
 
   let disposed = false;
   let restoreFailureDiagnosed = false;
   return () => {
-    if (disposed) return;
+    if (disposed) return true;
     const restored = adapter.restoreOriginalIfCurrent(wrapper);
     if (!restored.ok && !restoreFailureDiagnosed) {
       restoreFailureDiagnosed = true;
@@ -79,9 +79,10 @@ export function installLocaleHook(
       );
     }
     if (!restored.ok) {
-      return;
+      return false;
     }
     disposed = true;
     installedHooks.delete(adapter.runtime);
+    return true;
   };
 }

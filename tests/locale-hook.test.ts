@@ -153,10 +153,11 @@ describe("installLocaleHook", () => {
       code: "duplicate_locale_hook",
       message: expect.any(String),
     });
-    disposeDuplicate();
+    expect(disposeDuplicate()).toBe(true);
     expect(runtime.translate).toBe(installed);
-    disposeFirst();
+    expect(disposeFirst()).toBe(true);
     expect(runtime.translate).toBe(original);
+    expect(disposeFirst()).toBe(true);
   });
 
   it("fails open when translate is frozen and reports the install failure", () => {
@@ -177,7 +178,7 @@ describe("installLocaleHook", () => {
       code: "locale_hook_install_failed",
       message: expect.any(String),
     });
-    expect(dispose()).toBeUndefined();
+    expect(dispose()).toBe(true);
   });
 
   it("fails open when translate is a non-writable property", () => {
@@ -227,7 +228,7 @@ describe("installLocaleHook", () => {
 
     throwOnTranslateRead = true;
 
-    expect(dispose).not.toThrow();
+    expect(dispose()).toBe(false);
     expect(target.translate).toBe(installed);
     expect(diagnostics.snapshot()).toContainEqual({
       level: "error",
@@ -299,7 +300,7 @@ describe("installLocaleHook", () => {
     const installed = target.translate;
 
     ignoreRestore = true;
-    dispose();
+    expect(dispose()).toBe(false);
 
     expect(target.translate).toBe(installed);
     expect(diagnostics.snapshot()).toContainEqual({
@@ -531,8 +532,8 @@ describe("installLocaleHook", () => {
       createDiagnostics(),
     );
 
-    disposeFirst();
-    disposeFirst();
+    expect(disposeFirst()).toBe(true);
+    expect(disposeFirst()).toBe(true);
     expect(runtime.translate).toBe(original);
 
     const secondDiagnostics = createDiagnostics();
@@ -577,7 +578,7 @@ describe("installLocaleHook", () => {
       createDiagnostics(),
     );
 
-    dispose();
+    expect(dispose()).toBe(true);
 
     expect(runtime.translate).toBe(original);
     expect(Object.hasOwn(runtime, "translate")).toBe(false);
@@ -607,7 +608,7 @@ describe("installLocaleHook", () => {
     const installed = target.translate;
 
     failReads = true;
-    dispose();
+    expect(dispose()).toBe(false);
     failReads = false;
 
     const duplicateDiagnostics = createDiagnostics();
@@ -619,7 +620,7 @@ describe("installLocaleHook", () => {
     });
     expect(target.translate).toBe(installed);
 
-    dispose();
+    expect(dispose()).toBe(true);
     expect(target.translate).toBe(original);
   });
 

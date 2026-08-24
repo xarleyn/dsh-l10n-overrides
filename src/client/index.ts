@@ -28,6 +28,101 @@ export interface ClientOptions {
 
 export const inject = ["locale"];
 
+type CleanupState = "idle" | "running" | "done";
+
+interface CleanupResource {
+  state: CleanupState;
+  run: () => boolean;
+  diagnosed: boolean;
+  readonly code: string;
+  readonly message: string;
+}
+
+interface SharedInstallation {
+  refs: number;
+  readonly runtimeKey: object | undefined;
+  readonly diagnostics: Diagnostics;
+  readonly domCleanup: CleanupResource;
+  readonly listenerCleanup: CleanupResource;
+  readonly localeCleanup: CleanupResource;
+}
+
+const sharedInstallations = new WeakMap<object, SharedInstallation>();
+const terminalCleanup = (): boolean => true;
+
+function createCleanupResource(code: string, message: string): CleanupResource {
+  return {
+    state: "done",
+    run: terminalCleanup,
+    diagnosed: false,
+    code,
+    message,
+  };
+}
+
+function armCleanup(resource: CleanupResource, run: () => boolean): void {
+  resource.state = "idle";
+  resource.run = run;
+}
+
+function attemptCleanup(
+  installation: SharedInstallation,
+  resource: CleanupResource,
+): void {
+  if (resource.state !== "idle") return;
+  resource.state = "running";
+  try {
+    if (resource.run() === false) {
+      resource.state = "idle";
+      return;
+    }
+    resource.state = "done";
+    resource.run = terminalCleanup;
+  } catch {
+    resource.state = "idle";
+    if (resource.diagnosed) return;
+    resource.diagnosed = true;
+    installation.diagnostics.error(resource.code, resource.message);
+  }
+}
+
+function cleanupInstallation(installation: SharedInstallation): boolean {
+  attemptCleanup(installation, installation.domCleanup);
+  attemptCleanup(installation, installation.listenerCleanup);
+  attemptCleanup(installation, installation.localeCleanup);
+  const complete =
+    installation.domCleanup.state === "done" &&
+    installation.listenerCleanup.state === "done" &&
+    installation.localeCleanup.state === "done";
+  if (!complete) return false;
+
+  const { runtimeKey } = installation;
+  if (
+    runtimeKey !== undefined &&
+    sharedInstallations.get(runtimeKey) === installation
+  ) {
+    sharedInstallations.delete(runtimeKey);
+  }
+  return true;
+}
+
+function createLease(installation: SharedInstallation): () => void {
+  let released = false;
+  let terminal = false;
+  return () => {
+    if (terminal) return;
+    if (!released) {
+      released = true;
+      installation.refs -= 1;
+      if (installation.refs > 0) {
+        terminal = true;
+        return;
+      }
+    }
+    if (cleanupInstallation(installation)) terminal = true;
+  };
+}
+
 function selectDocument(options: ClientOptions): Document | undefined {
   if (options.document !== undefined) return options.document ?? undefined;
   return typeof document === "undefined" ? undefined : document;
@@ -42,11 +137,47 @@ function describeCount(
 }
 
 export function apply(ctx: Context, options: ClientOptions = {}): () => void {
+  let localeRuntime: unknown;
+  try {
+    localeRuntime = ctx.locale;
+  } catch {
+    localeRuntime = undefined;
+  }
+  const localeAdapter = adaptDshLocaleRuntime(localeRuntime);
+  const runtimeKey = localeAdapter?.runtime;
+  if (runtimeKey !== undefined) {
+    const existing = sharedInstallations.get(runtimeKey);
+    if (existing !== undefined) {
+      existing.refs += 1;
+      return createLease(existing);
+    }
+  }
+
   const diagnostics = new Diagnostics(
     options.logger ?? console,
     options.debug === undefined ? {} : { debug: options.debug },
   );
   const registry = new TranslationPackRegistry(diagnostics);
+  const installation: SharedInstallation = {
+    refs: 1,
+    runtimeKey,
+    diagnostics,
+    domCleanup: createCleanupResource(
+      "dom_dispose_failed",
+      "DOM translation could not be fully restored during disposal.",
+    ),
+    listenerCleanup: createCleanupResource(
+      "locale_listener_dispose_failed",
+      "The locale change listener could not be removed during disposal.",
+    ),
+    localeCleanup: createCleanupResource(
+      "locale_hook_dispose_failed",
+      "The locale override hook could not be restored during disposal.",
+    ),
+  };
+  if (runtimeKey !== undefined) {
+    sharedInstallations.set(runtimeKey, installation);
+  }
 
   for (const pack of translationPacks) {
     try {
@@ -65,17 +196,11 @@ export function apply(ctx: Context, options: ClientOptions = {}): () => void {
     `Loaded ${describeCount(stats.packs, "pack", "packs")}, ${describeCount(stats.localeOverrides, "locale override", "locale overrides")}, and ${describeCount(stats.domRules, "DOM rule", "DOM rules")}.`,
   );
 
-  let localeRuntime: unknown;
   try {
-    localeRuntime = ctx.locale;
-  } catch {
-    localeRuntime = undefined;
-  }
-
-  const localeAdapter = adaptDshLocaleRuntime(localeRuntime);
-  let restoreLocaleHook = (): void => undefined;
-  try {
-    restoreLocaleHook = installLocaleHook(localeRuntime, registry, diagnostics);
+    armCleanup(
+      installation.localeCleanup,
+      installLocaleHook(localeRuntime, registry, diagnostics),
+    );
   } catch {
     diagnostics.error(
       "locale_hook_startup_failed",
@@ -108,11 +233,16 @@ export function apply(ctx: Context, options: ClientOptions = {}): () => void {
   let domTranslator: DomTranslator | undefined;
   if (domAvailable && candidateDocument !== undefined && localeAdapter) {
     try {
-      domTranslator = new DomTranslator(
+      const translator = new DomTranslator(
         candidateDocument,
         registry.getDomRules("en"),
         diagnostics,
       );
+      domTranslator = translator;
+      armCleanup(installation.domCleanup, () => {
+        translator.dispose();
+        return true;
+      });
     } catch {
       diagnostics.error(
         "dom_startup_failed",
@@ -140,7 +270,6 @@ export function apply(ctx: Context, options: ClientOptions = {}): () => void {
     }
   }
 
-  let unsubscribeLocaleChange: (() => unknown) | undefined;
   if (domTranslator !== undefined) {
     let switchingFailureDiagnosed = false;
     try {
@@ -157,7 +286,10 @@ export function apply(ctx: Context, options: ClientOptions = {}): () => void {
         }
       });
       if (typeof unsubscribe === "function") {
-        unsubscribeLocaleChange = unsubscribe;
+        armCleanup(installation.listenerCleanup, () => {
+          unsubscribe();
+          return true;
+        });
       } else {
         diagnostics.error(
           "locale_listener_failed",
@@ -172,34 +304,5 @@ export function apply(ctx: Context, options: ClientOptions = {}): () => void {
     }
   }
 
-  let peripheralCleanupComplete = false;
-  return () => {
-    if (!peripheralCleanupComplete) {
-      peripheralCleanupComplete = true;
-      try {
-        domTranslator?.dispose();
-      } catch {
-        diagnostics.error(
-          "dom_dispose_failed",
-          "DOM translation could not be fully restored during disposal.",
-        );
-      }
-      try {
-        unsubscribeLocaleChange?.();
-      } catch {
-        diagnostics.error(
-          "locale_listener_dispose_failed",
-          "The locale change listener could not be removed during disposal.",
-        );
-      }
-    }
-    try {
-      restoreLocaleHook();
-    } catch {
-      diagnostics.error(
-        "locale_hook_dispose_failed",
-        "The locale override hook could not be restored during disposal.",
-      );
-    }
-  };
+  return createLease(installation);
 }
