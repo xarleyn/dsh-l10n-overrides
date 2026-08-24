@@ -64,9 +64,87 @@ const ATTRIBUTE_PROTECTED_SURFACE_SELECTOR = [
   ...SHARED_PROTECTED_SURFACES,
 ].join(",");
 
-// Dynamic scope activation is intentionally target-local. This lightweight
-// dependency extraction covers class, id, and basic attribute selectors,
-// including attributes nested inside selectors such as :has(...).
+function isScopeIdentifierStart(character: string | undefined): boolean {
+  return character !== undefined && /[A-Z_a-z\u0080-\uFFFF]/.test(character);
+}
+
+function consumeScopeIdentifier(scope: string, start: number): number {
+  let index = start;
+  if (scope[index] === "-") {
+    index += 1;
+    if (scope[index] === "-") index += 1;
+    else if (!isScopeIdentifierStart(scope[index])) return start;
+  } else if (isScopeIdentifierStart(scope[index])) {
+    index += 1;
+  } else {
+    return start;
+  }
+  while (
+    index < scope.length &&
+    /[-0-9A-Z_a-z\u0080-\uFFFF]/.test(scope[index] ?? "")
+  ) {
+    index += 1;
+  }
+  return index;
+}
+
+function consumeScopeAttribute(scope: string, start: number): number {
+  let quote: '"' | "'" | undefined;
+  for (let index = start + 1; index < scope.length; index += 1) {
+    const character = scope[index];
+    if (quote !== undefined) {
+      if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === "[") {
+      return start;
+    } else if (character === "]") {
+      return index + 1;
+    }
+  }
+  return start;
+}
+
+// Dynamic membership safety depends on target-local root selectors. v0.1
+// accepts one escape-free compound selector and leaves full syntax validation
+// to the browser; relational selectors require broader mutation tracking.
+function isSupportedScopeSelector(scope: string): boolean {
+  if (scope.length === 0 || scope.includes("\\") || scope.includes(","))
+    return false;
+  let index = 0;
+  let components = 0;
+  if (scope[index] === "*") {
+    index += 1;
+    components += 1;
+  } else {
+    const next = consumeScopeIdentifier(scope, index);
+    if (next !== index) {
+      index = next;
+      components += 1;
+    }
+  }
+  while (index < scope.length) {
+    const character = scope[index];
+    if (character === "." || character === "#") {
+      const next = consumeScopeIdentifier(scope, index + 1);
+      if (next === index + 1) return false;
+      index = next;
+      components += 1;
+    } else if (character === "[") {
+      const next = consumeScopeAttribute(scope, index);
+      if (next === index) return false;
+      index = next;
+      components += 1;
+    } else {
+      return false;
+    }
+  }
+  return components > 0;
+}
+
+// Dependency extraction is defense-in-depth for accepted compound selectors.
 function extractScopeDependencies(scope: string): ReadonlySet<string> {
   const dependencies = new Set<string>();
   if (scope.includes(".")) dependencies.add("class");
@@ -161,6 +239,13 @@ export class DomTranslator {
     this.#scopes = indexedScopes
       .filter(({ scope }) => {
         if (scope === "global") return true;
+        if (!isSupportedScopeSelector(scope)) {
+          this.diagnostics.error(
+            "invalid_dom_scope",
+            `Invalid DOM translation scope "${scope}" was ignored.`,
+          );
+          return false;
+        }
         try {
           this.document.createDocumentFragment().querySelector(scope);
           return true;

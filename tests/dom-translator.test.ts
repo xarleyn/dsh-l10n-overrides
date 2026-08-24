@@ -645,19 +645,128 @@ describe("DomTranslator", () => {
     ).toHaveLength(1);
   });
 
-  it("rejects attribute mappings that can invalidate their own nested scope", async () => {
+  it("rejects escaped selectors without translating attributes or feeding mutations back", async () => {
     document.body.innerHTML = `
-      <section class="wrapper"><span id="feedback" title="Enviar">Enviar</span></section>
+      <span id="feedback" title="Enviar">Enviar</span>
     `;
     const feedback = document.querySelector("#feedback") as Element;
     const setAttribute = vi.spyOn(feedback, "setAttribute");
+    const observe = vi.spyOn(MutationObserver.prototype, "observe");
     const diagnostics = createDiagnostics();
     const translator = createTranslator(
       [
         {
           source: "Enviar",
           target: "Send",
-          scope: '.wrapper:has([title="Enviar"])',
+          scope: String.raw`[t\itle="Enviar"]`,
+          attributes: ["title"],
+        },
+      ],
+      diagnostics,
+    );
+
+    translator.setLocale("en");
+    for (let turn = 0; turn < 10; turn += 1) await flushMutations();
+
+    expect(feedback.textContent).toBe("Enviar");
+    expect(feedback.getAttribute("title")).toBe("Enviar");
+    expect(
+      setAttribute.mock.calls.filter(([attribute]) => attribute === "title"),
+    ).toHaveLength(0);
+    expect(
+      diagnostics.snapshot().filter(({ code }) => code === "invalid_dom_scope"),
+    ).toHaveLength(1);
+    expect(observe).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["relational pseudo", ".wrapper:has([data-active])"],
+    ["descendant combinator", ".ancestor .plugin"],
+    ["child combinator", ".a > .b"],
+    ["adjacent sibling combinator", ".a + .b"],
+    ["general sibling combinator", ".a ~ .b"],
+    ["selector list", ".a,.b"],
+    ["negation pseudo", ".a:not(.b)"],
+  ])("rejects unsupported %s scopes", (_kind, scope) => {
+    document.body.innerHTML = `
+      <section class="wrapper"><span data-active>Enviar</span></section>
+      <section class="ancestor"><span class="plugin">Enviar</span></section>
+      <section class="a"><span class="b">Enviar</span></section>
+      <span class="a"></span><span class="b">Enviar</span>
+      <span class="a">Enviar</span>
+    `;
+    const diagnostics = createDiagnostics();
+    const translator = createTranslator(
+      [{ source: "Enviar", target: "Send", scope }],
+      diagnostics,
+    );
+
+    translator.setLocale("en");
+
+    expect(document.body.textContent).not.toContain("Send");
+    expect(
+      diagnostics.snapshot().filter(({ code }) => code === "invalid_dom_scope"),
+    ).toHaveLength(1);
+  });
+
+  it("supports root-local compound selectors with dynamic membership", async () => {
+    document.body.innerHTML = `
+      <section id="active" class="active" data-panel="no"><span>Uno</span></section>
+      <section id="exact" class="plugin"><span>Dos</span></section>
+      <article id="tagged" class="card" data-kind="primary secondary"><span>Tres</span></article>
+    `;
+    const translator = createTranslator([
+      {
+        source: "Uno",
+        target: "One",
+        scope: '.active[data-panel="yes"]',
+      },
+      {
+        source: "Dos",
+        target: "Two",
+        scope: "#exact.plugin[data-x]",
+      },
+      {
+        source: "Tres",
+        target: "Three",
+        scope: 'article.card[data-kind~="primary"][aria-label="Panel A"]',
+      },
+    ]);
+    translator.setLocale("en");
+    const active = document.querySelector("#active") as Element;
+    const exact = document.querySelector("#exact") as Element;
+    const tagged = document.querySelector("#tagged") as Element;
+
+    active.setAttribute("data-panel", "yes");
+    exact.setAttribute("data-x", "");
+    tagged.setAttribute("aria-label", "Panel A");
+    await flushMutations();
+
+    expect(active.textContent).toBe("One");
+    expect(exact.textContent).toBe("Two");
+    expect(tagged.textContent).toBe("Three");
+
+    active.setAttribute("data-panel", "no");
+    exact.removeAttribute("data-x");
+    tagged.setAttribute("aria-label", "Panel B");
+    await flushMutations();
+
+    expect(active.textContent).toBe("Uno");
+    expect(exact.textContent).toBe("Dos");
+    expect(tagged.textContent).toBe("Tres");
+  });
+
+  it("keeps attribute dependency conflicts as defense-in-depth", async () => {
+    document.body.innerHTML = `
+      <span id="feedback" title="Enviar">Enviar</span>
+    `;
+    const diagnostics = createDiagnostics();
+    const translator = createTranslator(
+      [
+        {
+          source: "Enviar",
+          target: "Send",
+          scope: '[title="Enviar"]',
           attributes: ["title"],
         },
       ],
@@ -666,14 +775,11 @@ describe("DomTranslator", () => {
 
     translator.setLocale("en");
     await flushMutations();
-    await flushMutations();
-    await flushMutations();
 
-    expect(feedback.textContent).toBe("Send");
-    expect(feedback.getAttribute("title")).toBe("Enviar");
-    expect(
-      setAttribute.mock.calls.filter(([attribute]) => attribute === "title"),
-    ).toHaveLength(0);
+    expect(document.querySelector("#feedback")?.textContent).toBe("Send");
+    expect(document.querySelector("#feedback")?.getAttribute("title")).toBe(
+      "Enviar",
+    );
     expect(
       diagnostics.snapshot().filter(({ code }) => code === "invalid_dom_rule"),
     ).toHaveLength(1);
