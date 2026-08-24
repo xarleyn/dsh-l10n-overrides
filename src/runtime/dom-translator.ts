@@ -26,7 +26,6 @@ const SCOPE_AND_PROTECTION_ATTRIBUTES = [
   "id",
   ...KNOWN_PROTECTION_ATTRIBUTES,
 ];
-const SCOPE_ATTRIBUTE_PATTERN = /\[\s*([^\s~|^$*=\]]+)/g;
 const SHARED_PROTECTED_SURFACES = [
   "[contenteditable]",
   "[data-no-translate]",
@@ -88,31 +87,90 @@ function consumeScopeIdentifier(scope: string, start: number): number {
   return index;
 }
 
-function consumeScopeAttribute(scope: string, start: number): number {
-  let quote: '"' | "'" | undefined;
-  for (let index = start + 1; index < scope.length; index += 1) {
-    const character = scope[index];
-    if (quote !== undefined) {
-      if (character === quote) quote = undefined;
-      continue;
-    }
-    if (character === '"' || character === "'") {
-      quote = character;
-    } else if (character === "[") {
-      return start;
-    } else if (character === "]") {
-      return index + 1;
-    }
+function skipScopeWhitespace(scope: string, start: number): number {
+  let index = start;
+  while (index < scope.length && /[\t\n\f\r ]/.test(scope[index] ?? "")) {
+    index += 1;
   }
-  return start;
+  return index;
+}
+
+interface ParsedScopeAttribute {
+  readonly dependency: string;
+  readonly nextIndex: number;
+}
+
+function parseScopeAttribute(
+  scope: string,
+  start: number,
+): ParsedScopeAttribute | undefined {
+  let index = skipScopeWhitespace(scope, start + 1);
+  const nameStart = index;
+  if (!/[A-Z_a-z]/.test(scope[index] ?? "")) return undefined;
+  index += 1;
+  while (index < scope.length && /[-0-9A-Z_a-z]/.test(scope[index] ?? "")) {
+    index += 1;
+  }
+  const dependency = scope.slice(nameStart, index).toLowerCase();
+  index = skipScopeWhitespace(scope, index);
+  if (scope[index] === "]") return { dependency, nextIndex: index + 1 };
+
+  const operatorStart = scope[index];
+  if (operatorStart === "=") {
+    index += 1;
+  } else if (
+    operatorStart !== undefined &&
+    "~|^$*".includes(operatorStart) &&
+    scope[index + 1] === "="
+  ) {
+    index += 2;
+  } else {
+    return undefined;
+  }
+
+  index = skipScopeWhitespace(scope, index);
+  const quote = scope[index];
+  if (quote === '"' || quote === "'") {
+    index += 1;
+    while (index < scope.length && scope[index] !== quote) index += 1;
+    if (scope[index] !== quote) return undefined;
+    index += 1;
+  } else {
+    const next = consumeScopeIdentifier(scope, index);
+    if (next === index) return undefined;
+    index = next;
+  }
+
+  const valueEnd = index;
+  index = skipScopeWhitespace(scope, index);
+  if (index > valueEnd && /[IiSs]/.test(scope[index] ?? "")) {
+    index += 1;
+    index = skipScopeWhitespace(scope, index);
+  }
+  if (scope[index] !== "]") return undefined;
+  return { dependency, nextIndex: index + 1 };
+}
+
+interface ParsedScopeSelector {
+  readonly dependencies: ReadonlySet<string>;
 }
 
 // Dynamic membership safety depends on target-local root selectors. v0.1
 // accepts one escape-free compound selector and leaves full syntax validation
 // to the browser; relational selectors require broader mutation tracking.
-function isSupportedScopeSelector(scope: string): boolean {
-  if (scope.length === 0 || scope.includes("\\") || scope.includes(","))
-    return false;
+function parseSupportedScopeSelector(
+  scope: string,
+): ParsedScopeSelector | undefined {
+  if (
+    scope.length === 0 ||
+    scope.includes("\\") ||
+    scope.includes(",") ||
+    scope.includes("/*") ||
+    scope.includes("*/")
+  ) {
+    return undefined;
+  }
+  const dependencies = new Set<string>();
   let index = 0;
   let components = 0;
   if (scope[index] === "*") {
@@ -129,31 +187,21 @@ function isSupportedScopeSelector(scope: string): boolean {
     const character = scope[index];
     if (character === "." || character === "#") {
       const next = consumeScopeIdentifier(scope, index + 1);
-      if (next === index + 1) return false;
+      if (next === index + 1) return undefined;
+      dependencies.add(character === "." ? "class" : "id");
       index = next;
       components += 1;
     } else if (character === "[") {
-      const next = consumeScopeAttribute(scope, index);
-      if (next === index) return false;
-      index = next;
+      const parsed = parseScopeAttribute(scope, index);
+      if (parsed === undefined) return undefined;
+      dependencies.add(parsed.dependency);
+      index = parsed.nextIndex;
       components += 1;
     } else {
-      return false;
+      return undefined;
     }
   }
-  return components > 0;
-}
-
-// Dependency extraction is defense-in-depth for accepted compound selectors.
-function extractScopeDependencies(scope: string): ReadonlySet<string> {
-  const dependencies = new Set<string>();
-  if (scope.includes(".")) dependencies.add("class");
-  if (scope.includes("#")) dependencies.add("id");
-  for (const match of scope.matchAll(SCOPE_ATTRIBUTE_PATTERN)) {
-    const attribute = match[1];
-    if (attribute !== undefined) dependencies.add(attribute.toLowerCase());
-  }
-  return dependencies;
+  return components > 0 ? { dependencies } : undefined;
 }
 
 interface ScopeRules {
@@ -236,32 +284,31 @@ export class DomTranslator {
       text: indexed.text,
       attributes: indexed.attributes,
     }));
-    this.#scopes = indexedScopes
-      .filter(({ scope }) => {
-        if (scope === "global") return true;
-        if (!isSupportedScopeSelector(scope)) {
-          this.diagnostics.error(
-            "invalid_dom_scope",
-            `Invalid DOM translation scope "${scope}" was ignored.`,
-          );
-          return false;
-        }
-        try {
-          this.document.createDocumentFragment().querySelector(scope);
-          return true;
-        } catch {
-          this.diagnostics.error(
-            "invalid_dom_scope",
-            `Invalid DOM translation scope "${scope}" was ignored.`,
-          );
-          return false;
-        }
-      })
-      .map(({ scope, text, attributes }) => {
-        const dependencies =
-          scope === "global"
-            ? new Set<string>()
-            : extractScopeDependencies(scope);
+    const validatedScopes = indexedScopes.flatMap((indexed) => {
+      if (indexed.scope === "global") {
+        return [{ ...indexed, dependencies: new Set<string>() }];
+      }
+      const parsed = parseSupportedScopeSelector(indexed.scope);
+      if (parsed === undefined) {
+        this.diagnostics.error(
+          "invalid_dom_scope",
+          `Invalid DOM translation scope "${indexed.scope}" was ignored.`,
+        );
+        return [];
+      }
+      try {
+        this.document.createDocumentFragment().querySelector(indexed.scope);
+      } catch {
+        this.diagnostics.error(
+          "invalid_dom_scope",
+          `Invalid DOM translation scope "${indexed.scope}" was ignored.`,
+        );
+        return [];
+      }
+      return [{ ...indexed, dependencies: parsed.dependencies }];
+    });
+    this.#scopes = validatedScopes.map(
+      ({ scope, text, attributes, dependencies }) => {
         const safeAttributes = new Map(attributes);
         for (const attribute of attributes.keys()) {
           if (!dependencies.has(attribute)) continue;
@@ -272,7 +319,8 @@ export class DomTranslator {
           );
         }
         return { scope, text, attributes: safeAttributes, dependencies };
-      });
+      },
+    );
     const translationAttributes = this.#scopes.flatMap(({ attributes }) => [
       ...attributes.keys(),
     ]);
