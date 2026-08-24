@@ -1,0 +1,80 @@
+{
+  "name": "dsh-l10n-overrides",
+  "version": "0.1.0",
+  "description": "English localization overrides for DeepSeek Harness plugins",
+  "packageManager": "pnpm@11.22.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./types": {
+      "types": "./lib/types/types.d.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/types/**/*.d.ts",
+    "README.md",
+    "SPEC.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('lib', { recursive: true, force: true })\"",
+    "format": "prettier --check . --end-of-line auto",
+    "format:write": "prettier --write . --end-of-line auto",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "pnpm run clean && tsdown && tsc -p tsconfig.build.json",
+    "test:package": "node scripts/verify-package.mjs && node scripts/verify-client-bundle.mjs",
+    "check": "pnpm run format && pnpm run typecheck && pnpm run test && pnpm run build && pnpm run test:package",
+    "prepare": "tsdown && tsc -p tsconfig.build.json",
+    "prepublishOnly": "pnpm run check"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "localization",
+    "web-ui"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-client-locale": ">=0.1.1-rc.2 <0.2.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-client-locale": "0.1.1-rc.2",
+    "@types/node": "^26.2.0",
+    "jsdom": "^26.1.0",
+    "prettier": "^3.6.2",
+    "tsdown": "^0.22.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.8"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

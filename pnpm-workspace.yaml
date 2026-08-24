@@ -1,0 +1,11 @@
+packages:
+  - .
+
+nodeLinker: hoisted
+autoInstallPeers: false
+
+minimumReleaseAgeExclude:
+  - "@deepseek-ai/*"
+
+allowBuilds:
+  esbuild: true
