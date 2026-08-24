@@ -13,6 +13,9 @@
 
 - Run an end-to-end smoke test inside a real DSH browser session, including
   plugin reload and disposal.
+- Harden duplicate installation under real Cordis fibers: keep locale listeners
+  owned per fiber, DOM translators per document, and prevent a partially drained
+  installation from being leased again.
 - Replace the example pack with reviewed translations for actual target plugins
   and record their supported version ranges.
 - Verify the packed npm tarball contents and imports from a clean consumer
