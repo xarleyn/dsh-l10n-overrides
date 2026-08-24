@@ -671,4 +671,74 @@ describe("installLocaleHook", () => {
     dispose();
     expect(target.translate).toBe(original);
   });
+
+  it("releases ownership after a clean getter-only install failure", () => {
+    const original = createTranslator("fallback");
+    const runtime = {
+      getSnapshot: () => ({ active: "en" }),
+      subscribe: () => () => undefined,
+    };
+    Object.defineProperty(runtime, "translate", {
+      configurable: true,
+      enumerable: true,
+      get: () => original,
+    });
+
+    const firstDiagnostics = createDiagnostics();
+    const disposeFirst = installLocaleHook(
+      runtime,
+      createRegistry(),
+      firstDiagnostics,
+    );
+    expect(firstDiagnostics.snapshot()).toContainEqual({
+      level: "error",
+      code: "locale_hook_install_failed",
+      message: expect.any(String),
+    });
+    expect(Reflect.get(runtime, "translate")).toBe(original);
+
+    const secondDiagnostics = createDiagnostics();
+    installLocaleHook(runtime, createRegistry(), secondDiagnostics);
+    expect(secondDiagnostics.snapshot()).toContainEqual({
+      level: "error",
+      code: "locale_hook_install_failed",
+      message: expect.any(String),
+    });
+    expect(
+      secondDiagnostics
+        .snapshot()
+        .some((entry) => entry.code === "duplicate_locale_hook"),
+    ).toBe(false);
+    expect(disposeFirst).not.toThrow();
+    expect(disposeFirst).not.toThrow();
+  });
+
+  it("does not overwrite a foreign translator exposed by a failed assignment", () => {
+    const original = createTranslator("original");
+    const foreign = createTranslator("foreign");
+    const target = {
+      translate: original,
+      getSnapshot: () => ({ active: "en" }),
+      subscribe: () => () => undefined,
+    };
+    const runtime = new Proxy(target, {
+      set(current, property): boolean {
+        if (property === "translate") {
+          current.translate = foreign;
+          return false;
+        }
+        return false;
+      },
+    });
+    const diagnostics = createDiagnostics();
+
+    installLocaleHook(runtime, createRegistry(), diagnostics);
+
+    expect(target.translate).toBe(foreign);
+    expect(diagnostics.snapshot()).toContainEqual({
+      level: "error",
+      code: "locale_hook_install_failed",
+      message: expect.any(String),
+    });
+  });
 });

@@ -109,10 +109,33 @@ export function adaptDshLocaleRuntime(
       return Reflect.apply(originalTranslate, runtime, args);
     },
     install(wrapper): LocaleInstallResult {
-      const failedInstall = (): LocaleInstallResult => ({
-        ok: false,
-        runtimeMayBePatched: !restoreOriginalTranslate(),
-      });
+      const inspectCurrent = ():
+        "wrapper" | "original" | "foreign" | "unknown" => {
+        try {
+          const current = Reflect.get(runtime, "translate");
+          if (current === wrapper) return "wrapper";
+          if (current === originalTranslate) return "original";
+          return "foreign";
+        } catch {
+          return "unknown";
+        }
+      };
+      const failedInstall = (): LocaleInstallResult => {
+        const beforeRollback = inspectCurrent();
+        if (beforeRollback === "wrapper") {
+          restoreOriginalTranslate();
+          const afterRollback = inspectCurrent();
+          return {
+            ok: false,
+            runtimeMayBePatched:
+              afterRollback === "wrapper" || afterRollback === "unknown",
+          };
+        }
+        return {
+          ok: false,
+          runtimeMayBePatched: beforeRollback === "unknown",
+        };
+      };
       try {
         if (!Reflect.set(runtime, "translate", wrapper)) {
           return failedInstall();
