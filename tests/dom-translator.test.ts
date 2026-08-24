@@ -1,0 +1,578 @@
+// @vitest-environment jsdom
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Diagnostics } from "../src/registry/diagnostics.js";
+import { DomTranslator } from "../src/runtime/dom-translator.js";
+import type { DomTranslationRule } from "../src/types.js";
+
+function createDiagnostics(): Diagnostics {
+  return new Diagnostics({
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  });
+}
+
+const translators = new Set<DomTranslator>();
+
+function createTranslator(
+  rules: readonly DomTranslationRule[],
+  diagnostics = createDiagnostics(),
+): DomTranslator {
+  const translator = new DomTranslator(document, rules, diagnostics);
+  translators.add(translator);
+  return translator;
+}
+
+afterEach(() => {
+  for (const translator of translators) translator.dispose();
+  translators.clear();
+  document.body.innerHTML = "";
+  vi.restoreAllMocks();
+});
+
+async function flushMutations(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+describe("DomTranslator", () => {
+  it("translates only exact scoped text while preserving surrounding whitespace", () => {
+    document.body.innerHTML = `
+      <section class="composer">
+        <span id="exact">  Enviar\n</span>
+        <span id="sentence">Enviar ahora</span>
+      </section>
+      <span id="outside">Enviar</span>
+    `;
+    const translator = createTranslator([
+      { source: "Enviar", target: "Send", scope: ".composer" },
+    ]);
+
+    translator.setLocale("en");
+
+    expect(document.querySelector("#exact")?.textContent).toBe("  Send\n");
+    expect(document.querySelector("#sentence")?.textContent).toBe(
+      "Enviar ahora",
+    );
+    expect(document.querySelector("#outside")?.textContent).toBe("Enviar");
+  });
+
+  it("never translates text in protected native or DSH surfaces", () => {
+    document.body.innerHTML = `
+      <main class="scope">
+        <input id="input" value="Enviar">
+        <textarea id="textarea">Enviar</textarea>
+        <pre id="pre">Enviar</pre>
+        <code id="code">Enviar</code>
+        <kbd id="kbd">Enviar</kbd>
+        <samp id="samp">Enviar</samp>
+        <script id="script" type="text/plain">Enviar</script>
+        <style id="style">Enviar</style>
+        <div id="editable" contenteditable>Enviar</div>
+        <div id="no-translate" data-no-translate>Enviar</div>
+        <div id="conversation" data-testid="conversation-panel">Enviar</div>
+        <div id="message" data-message-id="message-1">Enviar</div>
+        <div id="markdown" class="markdown-body">Enviar</div>
+        <div id="editor" data-testid="monaco-editor">Enviar</div>
+        <div id="terminal" class="terminal-output">Enviar</div>
+        <div id="prompt" data-testid="prompt-input">Enviar</div>
+        <div id="composer" data-testid="chat-composer">Enviar</div>
+        <div data-no-translate><span id="protected-child">Enviar</span></div>
+        <span id="allowed">Enviar</span>
+      </main>
+      <div data-testid="conversation-panel">
+        <section class="nested-scope"><span id="protected-scope">Enviar</span></section>
+      </div>
+    `;
+    const translator = createTranslator([
+      { source: "Enviar", target: "Send", scope: ".scope" },
+      { source: "Enviar", target: "Send", scope: ".nested-scope" },
+    ]);
+
+    translator.setLocale("en");
+
+    for (const id of [
+      "textarea",
+      "pre",
+      "code",
+      "kbd",
+      "samp",
+      "script",
+      "style",
+      "editable",
+      "no-translate",
+      "conversation",
+      "message",
+      "markdown",
+      "editor",
+      "terminal",
+      "prompt",
+      "composer",
+      "protected-child",
+      "protected-scope",
+    ]) {
+      expect(document.querySelector(`#${id}`)?.textContent, id).toBe("Enviar");
+    }
+    expect((document.querySelector("#input") as HTMLInputElement).value).toBe(
+      "Enviar",
+    );
+    expect(document.querySelector("#allowed")?.textContent).toBe("Send");
+  });
+
+  it("translates only explicitly listed safe attributes in scope", () => {
+    document.body.innerHTML = `
+      <section class="scope">
+        <input id="input" placeholder="Escribe" value="Escribe">
+        <textarea id="safe-textarea" placeholder="Escribe">Escribe</textarea>
+        <button id="title" title="Escribe" aria-label="Escribe">Button</button>
+        <img id="image" alt="Escribe" src="Escribe">
+        <div id="forbidden" data-label="Escribe" class="Escribe" title="Other"></div>
+        <a data-key="forbidden-all" id="Escribe" class="Escribe" href="Escribe" src="Escribe" value="Escribe" data-extra="Escribe"></a>
+        <div id="unlisted" title="Solo"></div>
+        <input id="protected-input" data-no-translate placeholder="Escribe">
+        <div data-testid="monaco-editor"><span id="protected-title" title="Escribe"></span></div>
+      </section>
+    `;
+    const translator = createTranslator([
+      {
+        source: "Escribe",
+        target: "Type here",
+        scope: ".scope",
+        attributes: ["placeholder", "title", "aria-label", "alt"],
+      },
+      {
+        source: "Solo",
+        target: "Alone",
+        scope: ".scope",
+        attributes: ["placeholder"],
+      },
+    ]);
+
+    translator.setLocale("en");
+
+    expect(document.querySelector("#input")?.getAttribute("placeholder")).toBe(
+      "Type here",
+    );
+    expect(document.querySelector("#title")?.getAttribute("title")).toBe(
+      "Type here",
+    );
+    expect(
+      document.querySelector("#safe-textarea")?.getAttribute("placeholder"),
+    ).toBe("Type here");
+    expect(document.querySelector("#safe-textarea")?.textContent).toBe(
+      "Escribe",
+    );
+    expect(document.querySelector("#title")?.getAttribute("aria-label")).toBe(
+      "Type here",
+    );
+    expect(document.querySelector("#image")?.getAttribute("alt")).toBe(
+      "Type here",
+    );
+    expect((document.querySelector("#input") as HTMLInputElement).value).toBe(
+      "Escribe",
+    );
+    expect(document.querySelector("#image")?.getAttribute("src")).toBe(
+      "Escribe",
+    );
+    expect(
+      document.querySelector("#forbidden")?.getAttribute("data-label"),
+    ).toBe("Escribe");
+    expect(document.querySelector("#forbidden")?.getAttribute("class")).toBe(
+      "Escribe",
+    );
+    expect(document.querySelector("#forbidden")?.getAttribute("title")).toBe(
+      "Other",
+    );
+    const forbidden = document.querySelector('[data-key="forbidden-all"]');
+    for (const attribute of [
+      "id",
+      "class",
+      "href",
+      "src",
+      "value",
+      "data-extra",
+    ]) {
+      expect(forbidden?.getAttribute(attribute), attribute).toBe("Escribe");
+    }
+    expect(document.querySelector("#unlisted")?.getAttribute("title")).toBe(
+      "Solo",
+    );
+    expect(
+      document.querySelector("#protected-input")?.getAttribute("placeholder"),
+    ).toBe("Escribe");
+    expect(
+      document.querySelector("#protected-title")?.getAttribute("title"),
+    ).toBe("Escribe");
+  });
+
+  it("translates dynamic descendants, new scope roots, and exact updates", async () => {
+    document.body.innerHTML = `
+      <section class="scope"><span id="text">Other</span></section>
+      <input class="scope" id="attribute" placeholder="Other">
+    `;
+    const translator = createTranslator([
+      { source: "Enviar", target: "Send", scope: ".scope" },
+      {
+        source: "Escribe",
+        target: "Type here",
+        scope: ".scope",
+        attributes: ["placeholder"],
+      },
+    ]);
+    translator.setLocale("en");
+
+    const added = document.createElement("span");
+    added.id = "added";
+    added.textContent = "Enviar";
+    document.querySelector("section.scope")?.append(added);
+    const newScope = document.createElement("section");
+    newScope.className = "scope";
+    newScope.innerHTML = '<span id="new-scope-text">Enviar</span>';
+    document.body.append(newScope);
+    const text = document.querySelector("#text")?.firstChild;
+    if (text !== undefined && text !== null) text.textContent = "Enviar";
+    document
+      .querySelector("#attribute")
+      ?.setAttribute("placeholder", "Escribe");
+
+    await flushMutations();
+
+    expect(added.textContent).toBe("Send");
+    expect(document.querySelector("#new-scope-text")?.textContent).toBe("Send");
+    expect(document.querySelector("#text")?.textContent).toBe("Send");
+    expect(
+      document.querySelector("#attribute")?.getAttribute("placeholder"),
+    ).toBe("Type here");
+  });
+
+  it("does not feed its own mutations back through another rule", async () => {
+    document.body.innerHTML =
+      '<section class="outer"><div class="inner"></div></section>';
+    const translator = createTranslator([
+      { source: "Uno", target: "One", scope: ".outer" },
+      { source: "One", target: "Chained", scope: ".inner" },
+    ]);
+    translator.setLocale("en");
+    const added = document.createElement("span");
+    added.textContent = "Uno";
+    document.querySelector(".inner")?.append(added);
+
+    await flushMutations();
+
+    expect(added.textContent).toBe("One");
+  });
+
+  it("is inactive until English, restores owned values, and preserves external changes", async () => {
+    document.body.innerHTML = `
+      <section class="scope">
+        <span id="owned-text">Enviar</span>
+        <span id="external-text">Enviar</span>
+        <input id="owned-attribute" placeholder="Escribe">
+        <input id="external-attribute" placeholder="Escribe">
+      </section>
+    `;
+    const translator = createTranslator([
+      { source: "Enviar", target: "Send", scope: ".scope" },
+      {
+        source: "Escribe",
+        target: "Type here",
+        scope: ".scope",
+        attributes: ["placeholder"],
+      },
+    ]);
+
+    translator.setLocale("zh");
+    expect(document.querySelector("#owned-text")?.textContent).toBe("Enviar");
+    expect(
+      document.querySelector("#owned-attribute")?.getAttribute("placeholder"),
+    ).toBe("Escribe");
+
+    translator.setLocale("en");
+    expect(document.querySelector("#owned-text")?.textContent).toBe("Send");
+    expect(
+      document.querySelector("#owned-attribute")?.getAttribute("placeholder"),
+    ).toBe("Type here");
+
+    const externalText = document.querySelector("#external-text");
+    const externalAttribute = document.querySelector("#external-attribute");
+    if (externalText !== null) externalText.textContent = "React text";
+    externalAttribute?.setAttribute("placeholder", "React placeholder");
+    translator.setLocale("zh");
+
+    expect(document.querySelector("#owned-text")?.textContent).toBe("Enviar");
+    expect(
+      document.querySelector("#owned-attribute")?.getAttribute("placeholder"),
+    ).toBe("Escribe");
+    expect(externalText?.textContent).toBe("React text");
+    expect(externalAttribute?.getAttribute("placeholder")).toBe(
+      "React placeholder",
+    );
+
+    if (externalText !== null) externalText.textContent = "Enviar";
+    externalAttribute?.setAttribute("placeholder", "Escribe");
+    translator.setLocale("en");
+    expect(document.querySelector("#owned-text")?.textContent).toBe("Send");
+    expect(externalText?.textContent).toBe("Send");
+
+    expect(() => translator.dispose()).not.toThrow();
+    expect(() => translator.dispose()).not.toThrow();
+    expect(document.querySelector("#owned-text")?.textContent).toBe("Enviar");
+    expect(externalText?.textContent).toBe("Enviar");
+    expect(
+      document.querySelector("#owned-attribute")?.getAttribute("placeholder"),
+    ).toBe("Escribe");
+
+    const later = document.createElement("span");
+    later.textContent = "Enviar";
+    document.querySelector(".scope")?.append(later);
+    translator.setLocale("en");
+    await flushMutations();
+    expect(later.textContent).toBe("Enviar");
+  });
+
+  it("restores the latest host source after active retranslation and tolerates repeated locales", async () => {
+    document.body.innerHTML = `
+      <section class="scope">
+        <span id="text">Uno</span>
+        <input id="attribute" placeholder="Escribe">
+      </section>
+    `;
+    const translator = createTranslator([
+      { source: "Uno", target: "One", scope: ".scope" },
+      { source: "Dos", target: "Two", scope: ".scope" },
+      {
+        source: "Escribe",
+        target: "Type here",
+        scope: ".scope",
+        attributes: ["placeholder"],
+      },
+      {
+        source: "Busca",
+        target: "Search",
+        scope: ".scope",
+        attributes: ["placeholder"],
+      },
+    ]);
+    translator.setLocale("en");
+    translator.setLocale("en");
+
+    const textNode = document.querySelector("#text")?.firstChild;
+    if (textNode !== null && textNode !== undefined)
+      textNode.textContent = "Dos";
+    document.querySelector("#attribute")?.setAttribute("placeholder", "Busca");
+    await flushMutations();
+    expect(document.querySelector("#text")?.textContent).toBe("Two");
+    expect(
+      document.querySelector("#attribute")?.getAttribute("placeholder"),
+    ).toBe("Search");
+
+    translator.setLocale("zh");
+    translator.setLocale("zh");
+
+    expect(document.querySelector("#text")?.textContent).toBe("Dos");
+    expect(
+      document.querySelector("#attribute")?.getAttribute("placeholder"),
+    ).toBe("Busca");
+  });
+
+  it("skips invalid scopes, supports global scope, and keeps the first duplicate tuple", () => {
+    document.body.innerHTML = `
+      <span id="global">Global source</span>
+      <section class="scope">
+        <span id="duplicate">Duplicate</span>
+        <button id="duplicate-attribute" title="Duplicate"></button>
+      </section>
+    `;
+    const diagnostics = createDiagnostics();
+    const translator = createTranslator(
+      [
+        { source: "Broken", target: "Never", scope: "[broken" },
+        { source: "Also broken", target: "Never", scope: "[broken" },
+        { source: "Global source", target: "Global target", scope: "global" },
+        {
+          source: "Duplicate",
+          target: "First",
+          scope: ".scope",
+          attributes: ["title"],
+        },
+        {
+          source: "Duplicate",
+          target: "Second",
+          scope: ".scope",
+          attributes: ["title"],
+        },
+      ],
+      diagnostics,
+    );
+
+    expect(() => translator.setLocale("en")).not.toThrow();
+
+    expect(document.querySelector("#global")?.textContent).toBe(
+      "Global target",
+    );
+    expect(document.querySelector("#duplicate")?.textContent).toBe("First");
+    expect(
+      document.querySelector("#duplicate-attribute")?.getAttribute("title"),
+    ).toBe("First");
+    expect(
+      diagnostics.snapshot().filter(({ code }) => code === "invalid_dom_scope"),
+    ).toHaveLength(1);
+  });
+
+  it("queries each declared scope once initially and never rescans document or body on mutations", async () => {
+    document.body.innerHTML = '<section class="scope"></section>';
+    const documentQuery = vi.spyOn(document, "querySelectorAll");
+    const translator = createTranslator([
+      { source: "Enviar", target: "Send", scope: ".scope" },
+      { source: "Cancelar", target: "Cancel", scope: ".scope" },
+    ]);
+
+    translator.setLocale("en");
+    expect(
+      documentQuery.mock.calls.filter(([selector]) => selector === ".scope"),
+    ).toHaveLength(1);
+
+    documentQuery.mockClear();
+    const bodyQuery = vi.spyOn(document.body, "querySelectorAll");
+    const added = document.createElement("span");
+    added.textContent = "Enviar";
+    document.querySelector(".scope")?.append(added);
+    await flushMutations();
+
+    expect(added.textContent).toBe("Send");
+    expect(documentQuery).not.toHaveBeenCalled();
+    expect(bodyQuery).not.toHaveBeenCalled();
+  });
+
+  it("observes attributes only when needed with the exact safe filter", () => {
+    document.body.innerHTML = '<section class="scope"></section>';
+    const observe = vi.spyOn(MutationObserver.prototype, "observe");
+
+    const textOnly = createTranslator([
+      { source: "Enviar", target: "Send", scope: ".scope" },
+    ]);
+    textOnly.setLocale("en");
+    expect(observe).toHaveBeenLastCalledWith(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    textOnly.dispose();
+
+    const withAttributes = createTranslator([
+      {
+        source: "Uno",
+        target: "One",
+        scope: ".scope",
+        attributes: ["title", "placeholder"],
+      },
+      {
+        source: "Dos",
+        target: "Two",
+        scope: ".scope",
+        attributes: ["title", "aria-label"],
+      },
+    ]);
+    withAttributes.setLocale("en");
+    expect(observe).toHaveBeenLastCalledWith(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["title", "placeholder", "aria-label"],
+    });
+  });
+
+  it("fails open with diagnostics when body or MutationObserver is unavailable", () => {
+    const bodylessDocument = document.implementation.createHTMLDocument();
+    bodylessDocument.body?.remove();
+    const bodylessDiagnostics = createDiagnostics();
+    const bodylessTranslator = new DomTranslator(
+      bodylessDocument,
+      [{ source: "Source", target: "Target", scope: "global" }],
+      bodylessDiagnostics,
+    );
+
+    expect(() => bodylessTranslator.setLocale("en")).not.toThrow();
+    expect(
+      bodylessDiagnostics
+        .snapshot()
+        .some(({ code }) => code === "dom_translation_failed"),
+    ).toBe(true);
+
+    const observerDiagnostics = createDiagnostics();
+    class ThrowingMutationObserver {
+      constructor() {
+        throw new Error("observer unavailable");
+      }
+    }
+    const hostileDocument = new Proxy(document, {
+      get(target, property, receiver): unknown {
+        if (property === "defaultView") {
+          return { MutationObserver: ThrowingMutationObserver };
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    }) as Document;
+    const observerTranslator = new DomTranslator(
+      hostileDocument,
+      [{ source: "Source", target: "Target", scope: "global" }],
+      observerDiagnostics,
+    );
+    expect(() => observerTranslator.setLocale("en")).not.toThrow();
+    expect(
+      observerDiagnostics
+        .snapshot()
+        .some(({ code }) => code === "dom_translation_failed"),
+    ).toBe(true);
+  });
+
+  it("contains hostile tree walking without throwing into the host", () => {
+    document.body.innerHTML = '<section class="scope">Enviar</section>';
+    const diagnostics = createDiagnostics();
+    vi.spyOn(document, "createTreeWalker").mockImplementation(() => {
+      throw new Error("tree walker unavailable");
+    });
+    const translator = createTranslator(
+      [{ source: "Enviar", target: "Send", scope: ".scope" }],
+      diagnostics,
+    );
+
+    expect(() => translator.setLocale("en")).not.toThrow();
+    expect(document.querySelector(".scope")?.textContent).toBe("Enviar");
+    expect(
+      diagnostics
+        .snapshot()
+        .filter(({ code }) => code === "dom_translation_failed"),
+    ).toHaveLength(1);
+  });
+
+  it("isolates a hostile mutation and continues the same observer batch", async () => {
+    document.body.innerHTML = '<section class="scope"></section>';
+    const diagnostics = createDiagnostics();
+    const translator = createTranslator(
+      [{ source: "Enviar", target: "Send", scope: ".scope" }],
+      diagnostics,
+    );
+    translator.setLocale("en");
+    const hostile = document.createElement("span");
+    hostile.textContent = "Enviar";
+    hostile.closest = (): never => {
+      throw new Error("closest unavailable");
+    };
+    const valid = document.createElement("span");
+    valid.textContent = "Enviar";
+
+    document.querySelector(".scope")?.append(hostile, valid);
+    await flushMutations();
+
+    expect(valid.textContent).toBe("Send");
+    expect(
+      diagnostics
+        .snapshot()
+        .filter(({ code }) => code === "dom_translation_failed"),
+    ).toHaveLength(1);
+  });
+});
