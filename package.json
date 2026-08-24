@@ -32,7 +32,8 @@
     "lib/**/*.js",
     "lib/types/**/*.d.ts",
     "README.md",
-    "SPEC.md",
+    "SPEC — dsh-l10n-overrides.md",
+    "ROADMAP.md",
     "LICENSE"
   ],
   "scripts": {
