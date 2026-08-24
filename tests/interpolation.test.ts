@@ -60,4 +60,36 @@ describe("interpolate", () => {
       "before {value} after",
     );
   });
+
+  it("preserves a placeholder when an own accessor throws during property access", () => {
+    const params = Object.defineProperty({}, "value", {
+      enumerable: true,
+      get(): never {
+        throw new Error("property access failed");
+      },
+    }) as Record<string, unknown>;
+    let result = "";
+
+    expect(() => {
+      result = interpolate("before {value} after", params);
+    }).not.toThrow();
+    expect(result).toBe("before {value} after");
+  });
+
+  it("preserves a placeholder when the has-own proxy trap throws", () => {
+    const params = new Proxy<Record<string, unknown>>(
+      {},
+      {
+        getOwnPropertyDescriptor(): never {
+          throw new Error("descriptor access failed");
+        },
+      },
+    );
+    let result = "";
+
+    expect(() => {
+      result = interpolate("before {value} after", params);
+    }).not.toThrow();
+    expect(result).toBe("before {value} after");
+  });
 });

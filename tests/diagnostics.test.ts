@@ -133,6 +133,23 @@ describe("Diagnostics", () => {
     );
   });
 
+  it("does not enable debug when the caller later mutates its options object", () => {
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      debug: vi.fn(),
+    };
+    const options: { debug?: boolean } = { debug: false };
+    const diagnostics = new Diagnostics(logger, options);
+
+    options.debug = true;
+    diagnostics.debug("lookup", "translation hit");
+
+    expect(diagnostics.snapshot()).toEqual([]);
+    expect(logger.debug).not.toHaveBeenCalled();
+  });
+
   it("preserves diagnostic call order in snapshots", () => {
     const logger = {
       info: vi.fn(),

@@ -5,12 +5,15 @@ type DiagnosticLogger = Pick<Console, "info" | "warn" | "error" | "debug">;
 const PREFIX = "[dsh-l10n-overrides]";
 
 export class Diagnostics {
+  readonly #debugEnabled: boolean;
   readonly #entries: DiagnosticEntry[] = [];
 
   constructor(
     private readonly logger: DiagnosticLogger = console,
-    private readonly options: { readonly debug?: boolean } = {},
-  ) {}
+    options: { readonly debug?: boolean } = {},
+  ) {
+    this.#debugEnabled = options.debug === true;
+  }
 
   info(code: string, message: string): void {
     this.#record("info", "info", code, message);
@@ -25,7 +28,7 @@ export class Diagnostics {
   }
 
   debug(code: string, message: string): void {
-    if (!this.options.debug) return;
+    if (!this.#debugEnabled) return;
 
     this.#record("debug", "debug", code, message);
   }
