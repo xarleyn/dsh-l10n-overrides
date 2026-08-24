@@ -207,6 +207,82 @@ describe("DomTranslator", () => {
     ).toBe("Escribe");
   });
 
+  it("rejects forbidden attributes from malformed runtime rules", () => {
+    document.body.innerHTML = `
+      <section class="scope">
+        <a data-key="target" href="Raw" src="Raw" value="Raw" class="Raw" id="Raw" data-extra="Raw"></a>
+      </section>
+    `;
+    const malformedRule = {
+      source: "Raw",
+      target: "Translated",
+      scope: ".scope",
+      attributes: ["href", "src", "value", "class", "id", "data-extra"],
+    } as unknown as DomTranslationRule;
+    const translator = createTranslator([malformedRule]);
+
+    translator.setLocale("en");
+
+    const target = document.querySelector('[data-key="target"]');
+    for (const attribute of [
+      "href",
+      "src",
+      "value",
+      "class",
+      "id",
+      "data-extra",
+    ]) {
+      expect(target?.getAttribute(attribute), attribute).toBe("Raw");
+    }
+  });
+
+  it("protects native code-like attributes while allowing control placeholders", () => {
+    document.body.innerHTML = `
+      <section class="scope">
+        <pre id="pre" title="Raw"><span id="pre-child" title="Raw"></span></pre>
+        <code id="code" title="Raw"></code>
+        <kbd id="kbd" title="Raw"></kbd>
+        <samp id="samp" title="Raw"></samp>
+        <script id="script" type="text/plain" title="Raw"></script>
+        <style id="style" title="Raw"></style>
+        <input id="input-placeholder" placeholder="Raw">
+        <textarea id="textarea-placeholder" placeholder="Raw"></textarea>
+      </section>
+    `;
+    const translator = createTranslator([
+      {
+        source: "Raw",
+        target: "Translated",
+        scope: ".scope",
+        attributes: ["title", "placeholder"],
+      },
+    ]);
+
+    translator.setLocale("en");
+
+    for (const id of [
+      "pre",
+      "pre-child",
+      "code",
+      "kbd",
+      "samp",
+      "script",
+      "style",
+    ]) {
+      expect(document.querySelector(`#${id}`)?.getAttribute("title"), id).toBe(
+        "Raw",
+      );
+    }
+    expect(
+      document.querySelector("#input-placeholder")?.getAttribute("placeholder"),
+    ).toBe("Translated");
+    expect(
+      document
+        .querySelector("#textarea-placeholder")
+        ?.getAttribute("placeholder"),
+    ).toBe("Translated");
+  });
+
   it("translates dynamic descendants, new scope roots, and exact updates", async () => {
     document.body.innerHTML = `
       <section class="scope"><span id="text">Other</span></section>
@@ -569,6 +645,35 @@ describe("DomTranslator", () => {
     await flushMutations();
 
     expect(valid.textContent).toBe("Send");
+    expect(
+      diagnostics
+        .snapshot()
+        .filter(({ code }) => code === "dom_translation_failed"),
+    ).toHaveLength(1);
+  });
+
+  it("isolates a hostile initial root and continues with later roots", () => {
+    document.body.innerHTML = `
+      <section class="scope" id="hostile">Enviar</section>
+      <section class="scope" id="healthy">Enviar</section>
+    `;
+    const hostile = document.querySelector("#hostile");
+    Object.defineProperty(hostile, "querySelectorAll", {
+      configurable: true,
+      value: (): never => {
+        throw new Error("root traversal unavailable");
+      },
+    });
+    const diagnostics = createDiagnostics();
+    const translator = createTranslator(
+      [{ source: "Enviar", target: "Send", scope: ".scope" }],
+      diagnostics,
+    );
+
+    expect(() => translator.setLocale("en")).not.toThrow();
+
+    expect(document.querySelector("#hostile")?.textContent).toBe("Enviar");
+    expect(document.querySelector("#healthy")?.textContent).toBe("Send");
     expect(
       diagnostics
         .snapshot()

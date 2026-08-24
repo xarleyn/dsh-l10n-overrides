@@ -1,6 +1,12 @@
 import type { Diagnostics } from "../registry/diagnostics.js";
 import type { DomTranslationAttribute, DomTranslationRule } from "../types.js";
 
+const DOM_TRANSLATION_ATTRIBUTES = new Set<DomTranslationAttribute>([
+  "placeholder",
+  "title",
+  "aria-label",
+  "alt",
+]);
 const SHARED_PROTECTED_SURFACES = [
   "[contenteditable]",
   "[data-no-translate]",
@@ -19,19 +25,24 @@ const SHARED_PROTECTED_SURFACES = [
   '[class*="terminal" i]',
   '[class*="prompt" i]',
 ];
-const TEXT_PROTECTED_SURFACE_SELECTOR = [
-  "input",
-  "textarea",
+const CODE_LIKE_PROTECTED_SURFACES = [
   "pre",
   "code",
   "kbd",
   "samp",
   "script",
   "style",
+];
+const TEXT_PROTECTED_SURFACE_SELECTOR = [
+  "input",
+  "textarea",
+  ...CODE_LIKE_PROTECTED_SURFACES,
   ...SHARED_PROTECTED_SURFACES,
 ].join(",");
-const ATTRIBUTE_PROTECTED_SURFACE_SELECTOR =
-  SHARED_PROTECTED_SURFACES.join(",");
+const ATTRIBUTE_PROTECTED_SURFACE_SELECTOR = [
+  ...CODE_LIKE_PROTECTED_SURFACES,
+  ...SHARED_PROTECTED_SURFACES,
+].join(",");
 
 interface ScopeRules {
   readonly scope: string;
@@ -93,6 +104,7 @@ export class DomTranslator {
         scopeRules.text.set(rule.source, rule);
       }
       for (const attribute of rule.attributes ?? []) {
+        if (!DOM_TRANSLATION_ATTRIBUTES.has(attribute)) continue;
         let attributeRules = scopeRules.attributes.get(attribute);
         if (attributeRules === undefined) {
           attributeRules = new Map();
@@ -139,21 +151,23 @@ export class DomTranslator {
     }
 
     for (const scopeRules of this.#scopes) {
+      let roots: readonly Element[];
       try {
-        const roots =
+        roots =
           scopeRules.scope === "global"
             ? this.document.body === null
               ? []
               : [this.document.body]
             : Array.from(this.document.querySelectorAll(scopeRules.scope));
-        for (const root of roots) this.#translateTree(root, scopeRules);
       } catch {
         this.#reportOnce(
-          `initial:${scopeRules.scope}`,
+          `initial-query:${scopeRules.scope}`,
           "dom_translation_failed",
-          `DOM translation failed for scope "${scopeRules.scope}".`,
+          `DOM translation roots could not be found for scope "${scopeRules.scope}".`,
         );
+        continue;
       }
+      for (const root of roots) this.#translateRoot(root, scopeRules);
     }
     this.#connectObserver();
   }
@@ -335,13 +349,25 @@ export class DomTranslator {
     if (!(node instanceof Element)) return;
     for (const scopeRules of this.#scopes) {
       if (this.#isInScope(node, scopeRules.scope)) {
-        this.#translateTree(node, scopeRules);
+        this.#translateRoot(node, scopeRules);
         continue;
       }
       if (scopeRules.scope === "global") continue;
       for (const root of node.querySelectorAll(scopeRules.scope)) {
-        this.#translateTree(root, scopeRules);
+        this.#translateRoot(root, scopeRules);
       }
+    }
+  }
+
+  #translateRoot(root: Element, rules: ScopeRules): void {
+    try {
+      this.#translateTree(root, rules);
+    } catch {
+      this.#reportOnce(
+        `root:${rules.scope}`,
+        "dom_translation_failed",
+        `DOM translation failed for a root in scope "${rules.scope}".`,
+      );
     }
   }
 
