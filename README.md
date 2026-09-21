@@ -1,3 +1,12 @@
+> [!IMPORTANT]
+> **This repository is archived and read-only.** The plugin moved into the
+> [`xarleyn/dsh-plugins`](https://github.com/xarleyn/dsh-plugins) monorepo and is published as
+> [`@yadsh/dsh-l10n-overrides`](https://www.npmjs.com/package/@yadsh/dsh-l10n-overrides)
+> (source: [`plugins/dsh-l10n-overrides`](https://github.com/xarleyn/dsh-plugins/tree/main/plugins/dsh-l10n-overrides)).
+> This standalone repository was a leftover; the plugin only lives in the monorepo.
+
+---
+
 # dsh-l10n-overrides
 
 English localization overrides for DeepSeek Harness plugins.
